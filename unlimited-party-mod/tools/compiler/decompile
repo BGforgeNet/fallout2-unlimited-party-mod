@@ -1,0 +1,2869 @@
+#!/usr/bin/ruby -w
+
+# decompile - Decompiler for Fallout script files.
+# Copyright (C) 2003 Noid
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+
+
+#####
+# A node is an element of the parse tree used when decompiling the script
+# file.  It keeps track of the offset of this node, plus the offset of the
+# following node.
+#
+class Node
+  def initialize(offset, next_offset)
+    @offset, @next_offset = offset, next_offset
+  end
+
+  attr_reader :offset
+  attr_accessor :next_offset
+
+  def statement?            ; false ; end
+  def if_statement?         ; false ; end
+  def expression?           ; false ; end
+  def call_expression?      ; false ; end
+  def opcode?               ; false ; end
+  def int?                  ; false ; end
+  def float?                ; false ; end
+  def string?               ; false ; end
+  def label?                ; false ; end
+  def procedure_name?       ; false ; end
+  def script_var_name?      ; false ; end
+  def local_var_name?       ; false ; end
+  def compound_expression?  ; false ; end
+
+  # Returns string that the node represents in the decompilation.
+  # indent: string to use for a single level of indentation.
+  # level: level to indent this node at.
+  def node_str(indent, level)
+    "unimplemented"
+  end
+end
+
+#####
+# A node that contains a particular opcode.  As the decompilation occurs,
+# these nodes will be reduced to more abstract nodes.
+#
+class OpcodeNode < Node
+  def initialize(container, offset, opcode, val = nil)
+    if (opcode == 0x9001 or opcode == 0xa001 or opcode == 0xc001)
+      size = 6
+    else
+      size = 2
+    end
+
+    super(offset, offset + size)
+
+    @container = container
+    @opcode = opcode
+    @value  = val
+
+    @is_expression = (size == 6) ? true : false
+  end
+
+  attr_reader :opcode
+
+  def expression?
+    @is_expression
+  end
+  def opcode?
+    true
+  end
+
+  # Whether the opcodes has a value associated with it
+  def has_value?
+    not @value.nil?
+  end
+
+  def int
+    raise "not an int" unless @opcode == 0xc001
+    @value
+  end
+  def int?
+    @opcode == 0xc001
+  end
+
+  def float
+    raise "not a float" unless @opcode == 0xa001
+    @value
+  end
+  def float?
+    @opcode == 0xa001
+  end
+
+  def string
+    raise "not a string" unless @opcode == 0x9001
+    @container.string(@value)
+  end
+  def string?
+    @opcode == 0x9001 and string() != nil
+  end
+
+  def label
+    raise "not a label" unless (@opcode == 0x9001 or @opcode == 0xc001)         ##### 0xc001 hack for bcgengrd.int
+    @container.label(@value)
+  end
+  def label?
+    @opcode == 0x9001 and label() != nil
+  end
+
+  def procedure_name
+    raise "not a procedure name" unless @opcode == 0xc001
+    @container.procedure_name(@value)
+  end
+  def procedure_name?
+    @opcode == 0xc001 and procedure_name() != nil
+  end
+
+  def script_var_name
+    raise "not a script variable name" unless @opcode == 0xc001
+    @container.script_var_name(@value)
+  end
+  def script_var_name?
+    @opcode == 0xc001 and script_var_name() != nil
+  end
+
+  def local_var_name
+    raise "not a local variable name" unless @opcode == 0xc001
+    @container.local_var_name(@value)
+  end
+  def local_var_name?
+    @opcode == 0xc001 and local_var_name() != nil
+  end
+
+  def value
+    return nil if @value.nil?
+
+    # default is to interpret symtab entries as string rather than label
+    return string() if @opcode == 0x9001
+    return @value.to_s
+  end
+
+  def expr_str
+    raise "not an expression" unless expression?
+    value()
+  end
+
+  def node_str(indent, level)
+    str = ""
+    if @opcode == 0xc001
+      str = "asm_push_value(#{@value.to_s});"
+    elsif @opcode == 0xa001
+      str = "asm_push_value(#{@value.to_s});"
+    elsif @opcode == 0x9001
+      if string() and not label()
+        str = "asm_push_value(#{string()});"
+      else
+        str = "asm_push_symbol(#{@value.to_s});"
+      end
+    else
+      str = sprintf("asm(0x%x);", @opcode)
+    end
+
+    (indent * level) + str
+  end
+end
+
+#####
+# A node that contains an expression.
+#
+class ExpressionNode < Node
+  def initialize(offset, next_offset, expr)
+    super(offset, next_offset)
+    @expr = expr
+  end
+
+  def expression?
+    true
+  end
+
+  def node_str(indent, level)
+    (indent * level) + "asm_expr(#{@expr});"
+  end
+
+  def expr_str
+    @expr
+  end
+end
+
+#####
+# A node that contains an expression that has been build from multiple
+# expression nodes, e.g. (2 + 3).
+#
+class CompoundExpressionNode < ExpressionNode
+  def initialize(offset, next_offset, expr, precedence)
+    super(offset, next_offset, expr)
+    @precedence = precedence
+  end
+
+  attr_reader :precedence
+
+  def compound_expression?
+    true
+  end
+end
+
+#####
+# A node that contains an expression that displays as a statement.
+# This is only used by opcode 0x8102 - op_critter_add_trait().
+#
+class FunnyExpressionNode < ExpressionNode
+  def initialize(offset, next_offset, expr)
+    super(offset, next_offset, expr)
+  end
+
+  def node_str(indent, level)
+    (indent * level) + @expr + ";"
+  end
+end
+
+#####
+# A node that contains a call expression.
+#
+class CallExpressionNode < ExpressionNode
+  def initialize(offset, next_offset, expr)
+    super(offset, next_offset, expr)
+  end
+
+  def call_expression?
+    true
+  end
+
+  def node_str(indent, level)
+    (indent * level) + "asm_call_expr(#{@expr});"
+  end
+end
+
+#####
+# A node that contains a statement.
+#
+class StatementNode < Node
+  def initialize(offset, next_offset, stmt)
+    super(offset, next_offset)
+    @stmt = stmt
+  end
+
+  def statement?
+    true
+  end
+
+  def node_str(indent, level)
+    (indent * level) + @stmt
+  end
+end
+
+#####
+# A node that contains a while statement.
+#
+class WhileStatementNode < StatementNode
+  def initialize(offset, next_offset, expr, nodes)
+    super(offset, next_offset, nil)
+    @expr = expr
+    @nodes = nodes
+  end
+
+  def node_str(indent, level)
+    indent_string = (indent * level)
+    lines = Array.new
+    lines.push(indent_string + "while (#{@expr}) do")
+    lines.push(indent_string + "begin") if @nodes.size != 1
+    @nodes.each { |n| lines.push(n.node_str(indent, level + 1)) }
+    lines.push(indent_string + "end") if @nodes.size != 1
+    lines.join("\n")
+  end
+end
+
+#####
+# A node that contains an if statement.
+#
+class IfStatementNode < StatementNode
+  def initialize(offset, next_offset, expr, if_nodes, else_nodes)
+    super(offset, next_offset, nil)
+    @expr = expr
+    @if_nodes = if_nodes
+    @else_nodes = else_nodes
+  end
+
+  def if_statement?
+    true
+  end
+
+  def node_str(indent, level)
+    indent_string = (indent * level)
+    lines = Array.new
+    lines.push(indent_string + "if (#{@expr}) then")
+
+    # decide whether we need to enclose the if nodes inside begin .. end
+    enclose_block = (@if_nodes.size != 1 or @if_nodes[0].if_statement?)
+
+    lines.push(indent_string + "begin") if enclose_block
+    @if_nodes.each { |n| lines.push(n.node_str(indent, level + 1)) }
+    lines.push(indent_string + "end") if enclose_block
+
+    if @else_nodes != nil
+      if @else_nodes.size == 1 and @else_nodes[0].if_statement?
+        # chain if / else if
+        str = @else_nodes[0].node_str(indent, level)
+        lines.push(str.sub(/^ +/, indent_string + "else "))
+      else
+        enclose_block = (@else_nodes.size != 1 or @else_nodes[0].if_statement?)
+        lines.push(indent_string + "else")
+        lines.push(indent_string + "begin") if enclose_block
+        @else_nodes.each { |n| lines.push(n.node_str(indent, level + 1)) }
+        lines.push(indent_string + "end") if enclose_block
+      end
+    end
+    lines.join("\n")
+  end
+end
+
+
+#####
+# A base class for a container that will contain nodes.  These nodes
+# initially contain opcodes, but are eventually reduced into a higher
+# level of abstraction.
+#
+class NodeContainer
+
+  # Create a new node container to contain a given amount of opcode data.
+  def initialize(script, size)
+    raise "internal error: node container size is -ve" if size < -1
+    @script = script
+    @size = size
+    @nodes = []
+  end
+
+  # experimental replacement for read() - this appears to be about 10% faster
+  def experimental_read(io)
+    offset = io.pos
+    if @size == -1
+      str = io.read()
+    else
+      str = io.read(@size)
+    end
+    num = str.length / 2
+    shorts = str.unpack("n" * num)
+
+    i = 0
+    while i < shorts.length
+      op = shorts.at(i)
+      i += 1
+      delta = 2
+
+      val = nil
+      if op == 0xc001
+        s1 = shorts.at(i)
+        i += 1
+        s2 = shorts.at(i)
+        i += 1
+        val = s1 << 16 | s2
+        delta += 4
+      elsif op == 0x9001
+        s1 = shorts.at(i)
+        i += 1
+        s2 = shorts.at(i)
+        i += 1
+        val = s1 << 16 | s2
+        delta += 4
+      elsif op == 0xa001
+        s1 = shorts.at(i)
+        i += 1
+        s2 = shorts.at(i)
+        i += 1
+        val = s1 << 16 | s2
+        val = [val].pack("N").unpack("g").at(0)
+        delta += 4
+      end
+
+      @nodes.push(OpcodeNode.new(self, offset, op, val))
+
+      offset += delta
+    end
+
+  end
+
+  # Read @size bytes from the given input stream and store the opcodes
+  # in the nodes list.
+  def read(io)
+    start_offset = io.pos
+    while io.pos < (start_offset + @size) or (@size == -1 and ! io.eof?)
+      opcode = next_opcode(io)
+      @nodes.push(opcode)
+    end
+    if (@size == -1)
+      @size = io.pos - start_offset
+    elsif (io.pos - start_offset) != @size
+      raise "read mismatch #{(io.pos - start_offset)} != #{@size}"
+    end
+  end
+
+  def string(idx)
+    @script.string(idx)
+  end
+
+  def label(idx)
+    @script.label(idx)
+  end
+
+  def procedure_name(idx)
+    @script.procedure_name(idx)
+  end
+
+  def script_var_name(idx)
+    @script.script_var_name(idx)
+  end
+
+  def local_var_name(idx)
+    raise "local variables are not supported by this node container"
+  end
+
+  #-----------------
+  private
+
+  # Read an opcode from the io stream, and return it as a node.
+  def next_opcode(io)
+    offset = io.pos
+    op = io.read_uint16()
+
+    val = nil
+    if op == 0xc001
+      val = io.read_uint32()
+    elsif op == 0x9001
+      val = io.read_uint32()
+    elsif op == 0xa001
+      val = io.read_float()
+    end
+
+    return OpcodeNode.new(self, offset, op, val)
+  end
+
+  # Removes a sequence of opcodes from the head of the node list.  The
+  # node list must match with the given opcode list.
+  def remove_opcodes_from_head(opcodes)
+    raise "not enough nodes" if @nodes.size < opcodes.size
+    opcodes.size.times do |i|
+      node = @nodes[i]
+      if ! node.opcode? or node.opcode != opcodes[i]
+        raise "head does not match"
+      end
+    end
+
+    @nodes.slice!(0, opcodes.size)
+  end
+
+  # Removes a sequence of opcodes from the tail of the node list.  The
+  # node list must match with the given opcode list.
+  def remove_opcodes_from_tail(opcodes)
+    raise "not enough nodes" if @nodes.size < opcodes.size
+    opcodes.size.times do |i|
+      node = @nodes[@nodes.size - opcodes.size + i]
+      if ! node.opcode? or node.opcode != opcodes[i]
+        raise "tail does not match"
+      end
+    end
+
+    @nodes.slice!(-opcodes.size, opcodes.size)
+  end
+end
+
+
+module OpcodeList
+  STATEMENT         = "S"
+  FUNNY_EXPRESSION  = "X"
+  EXPRESSION        = "E"
+  PROCEDURE         = "P"
+
+  UMINUS         = "UNARY MINUS"
+  NO_PAREN       = "NO PARENTHESIS"
+
+  LEFT_ASSOC     = "LEFT"
+  RIGHT_ASSOC    = "RIGHT"
+  NON_ASSOC      = "NONASSOC"
+end
+
+class Rules
+  include OpcodeList
+
+  def initialize
+    @valid_prefix_param = [EXPRESSION, PROCEDURE]
+    @valid_prefix_ret   = [STATEMENT, EXPRESSION, FUNNY_EXPRESSION]
+
+    @return_opcodes          = [0x800d, 0x8019, 0x802a, 0x8029, 0x800c, 0x801c]
+    @return_opcodes_critical = [0x800d, 0x8019, 0x802a, 0x8029, 0x800c, 0x8003,
+                                0x801c]
+  end
+
+
+  def can_reduce_if_then(procedure, nodes, index, opcode, name)
+    return false if index < 2
+    return false unless nodes[index - 1].expression?
+    return false unless nodes[index - 2].int?
+    out_addr = nodes[index - 2].int
+    return false if nodes.last.next_offset < out_addr
+
+    next_offset = nodes[index].next_offset
+    return true if next_offset == out_addr
+
+    i = index + 1
+    while i < nodes.length
+      next_offset = nodes[i].next_offset
+      break if next_offset == out_addr
+      return false if (nodes[i].opcode? and (nodes[i].opcode == 0x802f or nodes[i].opcode == 0x8030))
+      i += 1
+    end
+    return false unless next_offset == out_addr
+
+    # check for else
+    if (nodes[i - 1].opcode? and nodes[i - 1].opcode == 0x8004 and
+        nodes[i - 2].int?)
+      out_addr = nodes[i - 2].int 
+
+      while i < nodes.length and next_offset != out_addr
+        i += 1
+        next_offset = nodes[i].next_offset if i < nodes.length
+      end
+      return false unless next_offset == out_addr
+    end
+
+    return true
+  end
+  def reduce_if_then(procedure, nodes, index, opcode, name)
+    offset = nodes[index - 2].offset
+
+    expr_node = nodes[index - 1]
+    out_addr = nodes[index - 2].int
+    if_nodes = []
+    else_nodes = nil
+
+    next_offset = nodes[index].next_offset
+    num_nodes = 3
+
+    i = index
+    while i < nodes.length and next_offset != out_addr
+      i += 1
+      if i < nodes.length
+        next_offset = nodes[i].next_offset
+        if_nodes.push(nodes[i])
+      end
+    end
+
+    if (if_nodes.size >= 2 and if_nodes[-1].opcode? and
+        if_nodes[-1].opcode == 0x8004 and if_nodes[-2].int?)
+      out_addr = if_nodes[-2].int
+      if_nodes.slice!(-2, 2)
+      else_nodes = []
+      while i < nodes.length and next_offset != out_addr
+        i += 1
+        if i < nodes.length
+          next_offset = nodes[i].next_offset
+          else_nodes.push(nodes[i])
+        end
+      end
+      num_nodes += (2 + else_nodes.size)
+    end
+
+    num_nodes += if_nodes.size
+
+    procedure.reducer.reduce(procedure, if_nodes)
+    procedure.reducer.reduce(procedure, else_nodes) unless else_nodes.nil?
+
+    node = IfStatementNode.new(offset, next_offset, expr_node.expr_str,
+                               if_nodes, else_nodes)
+    nodes[index - 2, num_nodes] = node
+  end
+
+
+  def can_reduce_while_do(procedure, nodes, index, opcode, name)
+    return false if index < 2
+    return false unless nodes[index - 1].expression?
+    return false unless nodes[index - 2].int?
+    out_addr = nodes[index - 2].int
+    return false if nodes.last.next_offset < out_addr
+
+    next_offset = nodes[index].next_offset
+    return true if next_offset == out_addr
+
+    i = index
+    while i < nodes.length
+      next_offset = nodes[i].next_offset
+      break if next_offset == out_addr
+      i += 1
+    end
+    return false unless next_offset == out_addr
+
+    # check for loop back
+    return false unless (nodes[i].opcode? and
+                         nodes[i].opcode == 0x8004 and
+                         nodes[i - 1].int? and
+                         nodes[i - 1].int == nodes[index - 1].offset)
+    return true
+  end
+
+
+  def reduce_while_do(procedure, nodes, index, opcode, name)
+    offset = nodes[index - 2].offset
+
+    expr_node = nodes[index - 1]
+    out_addr = nodes[index - 2].int
+
+    body = []
+    next_offset = nodes[index].next_offset
+
+    i = index + 1
+    while i < nodes.length
+      next_offset = nodes[i].next_offset
+      body.push(nodes[i])
+      break if next_offset == out_addr
+      i += 1
+    end
+    body.slice!(-2, 2)
+    num_nodes = body.size + 5
+
+    procedure.reducer.reduce(procedure, body)
+
+    node = WhileStatementNode.new(offset, next_offset, expr_node.expr_str,
+                                  body)
+    nodes[index - 2, num_nodes] = node
+  end
+
+
+  def can_reduce_infix(procedure, nodes, index, opcode, name, precedence, assoc)
+    return false if index < 2
+    return false unless nodes[index - 1].expression?
+    return false unless nodes[index - 2].expression?
+    return true
+  end
+  def reduce_infix(procedure, nodes, index, opcode, name, precedence, assoc)
+    next_offset = nodes[index].next_offset
+    offset = nodes[index - 2].offset
+
+    expr1_node = nodes[index - 1]
+    expr2_node = nodes[index - 2]
+
+    str = ""
+
+    if expr2_node.compound_expression? and
+       (expr2_node.precedence != precedence or assoc != LEFT_ASSOC)
+      str += "(" + expr2_node.expr_str + ")"
+    else
+      str += expr2_node.expr_str
+    end
+
+    str += " #{name} "
+    if expr1_node.compound_expression? and 
+       (expr1_node.precedence != precedence or assoc != RIGHT_ASSOC)
+      str += "(" + expr1_node.expr_str + ")"
+    else
+      str += expr1_node.expr_str
+    end
+
+#      str = "(#{expr2_node.expr_str} #{name} #{expr1_node.expr_str})"
+
+    node = CompoundExpressionNode.new(offset, next_offset, str, precedence)
+    nodes[index - 2, 3] = node
+  end
+
+
+  def can_reduce_callwhen(procedure, nodes, index, opcode, name)
+    return false if index < 8
+    return false unless nodes[index - 1].procedure_name?
+    node = nodes[index - 2]
+    return false unless (node.int? and node.int == nodes[index - 6].offset)
+    node = nodes[index - 3]
+    return false unless (node.opcode? and node.opcode == 0x8011)
+    node = nodes[index - 4]
+    return false unless (node.opcode? and node.opcode == 0x8003)
+    return false unless nodes[index - 5].expression?
+    node = nodes[index - 6]
+    return false unless (node.opcode? and node.opcode == 0x8002)
+    node = nodes[index - 7]
+    return false unless (node.opcode? and node.opcode == 0x8004)
+    node = nodes[index - 8]
+    return false unless (node.int? and node.int == nodes[index - 2].offset)
+    return true
+  end
+  def reduce_callwhen(procedure, nodes, index, opcode, name)
+    next_offset = nodes[index].next_offset
+    offset = nodes[index - 8].offset
+
+    procedure_name = nodes[index - 1].procedure_name
+    expr_node = nodes[index - 5]
+
+    str = "call #{procedure_name} when #{expr_node.expr_str};"
+
+    node = StatementNode.new(offset, next_offset, str)
+    nodes[index - 8, 9] = node
+  end
+
+
+  def can_reduce_addregion(procedure, nodes, index, opcode, name)
+    return false if index < 1
+    return false unless nodes[index - 1].int?
+    num = nodes[index - 1].int
+    return false if index < num
+    (num - 1).times do |i|
+      return false unless nodes[index - i - 2].int?
+    end
+    return false unless nodes[index - num - 1].string?
+    return true
+  end
+  def reduce_addregion(procedure, nodes, index, opcode, name)
+    next_offset = nodes[index].next_offset
+    num = nodes[index - 1].int
+    offset = nodes[index - 1 - num].offset
+
+    vals = []
+    name = nodes[index - 1 - num].string
+    (num - 1).times do |i|
+      vals.push(nodes[index - num + i].int)
+    end
+
+    str = "addregion #{name} {#{vals.join(", ")}};"
+
+    node = StatementNode.new(offset, next_offset, str)
+    num_nodes = num + 2
+    nodes[index - num_nodes + 1, num_nodes] = node
+  end
+
+
+  def can_reduce_callin(procedure, nodes, index, opcode, name)
+    return false if index < 2
+    return false unless nodes[index - 1].procedure_name?
+    return false unless nodes[index - 2].expression?
+    return true
+  end
+  def reduce_callin(procedure, nodes, index, opcode, name)
+    next_offset = nodes[index].next_offset
+    offset = nodes[index - 2].offset
+
+    procedure_name = nodes[index - 1].procedure_name
+    expr_node = nodes[index - 2]
+
+    str = "call #{procedure_name} in #{expr_node.expr_str};"
+
+    node = StatementNode.new(offset, next_offset, str)
+    nodes[index - 2, 3] = node
+  end
+
+
+  def can_reduce_indirect_call(procedure, nodes, index, opcode, name)
+    return false unless (index + 4) < nodes.size
+    return false unless nodes[index - 1].expression?
+    node = nodes[index - 2]
+    return false unless node.int?
+    num_args = node.int
+    return false if index < (num_args + 4)
+    num_args.times do |i|
+      return false unless nodes[index - i - 3].expression?
+    end
+    node = nodes[index - num_args - 3]
+    return false unless (node.opcode? and node.opcode == 0x800d)
+    node = nodes[index - num_args - 4]
+    return false unless (node.int? and node.int == nodes[index + 4].next_offset)
+    return false unless (nodes[index + 1].opcode? and nodes[index + 1].opcode == 0x801b)
+    return false unless (nodes[index + 2].int?)
+    return false unless (nodes[index + 3].opcode? and nodes[index + 3].opcode == 0x8027)
+    return false unless (nodes[index + 4].opcode? and nodes[index + 4].opcode == 0x8005)
+    return true
+  end
+  def reduce_indirect_call(procedure, nodes, index, opcode, name)
+    next_offset = nodes[index + 4].next_offset
+
+    procedure_expr = nodes[index - 1].expr_str
+    num_args = nodes[index - 2].int
+    exprs = []
+    num_args.times do |i|
+      exprs.push nodes[index - num_args - 2 + i].expr_str
+    end
+
+    offset = nodes[index - num_args - 4].offset
+
+    str = "${" + procedure_expr + "}"
+    if num_args > 0
+      str += "(" + exprs.join(", ") + ")"
+    elsif num_args == 0
+      str += "()"
+    end
+
+    node = CallExpressionNode.new(offset, next_offset, str)
+    num_nodes = num_args + 5
+    nodes[index - num_nodes + 1, num_nodes + 4] = node
+  end
+
+
+  def can_reduce_call(procedure, nodes, index, opcode, name)
+    return false unless nodes[index - 1].procedure_name?
+    node = nodes[index - 2]
+    return false unless node.int?
+    num_args = node.int
+    return false if index < (num_args + 4)
+    num_args.times do |i|
+      return false unless nodes[index - i - 3].expression?
+    end
+    node = nodes[index - num_args - 3]
+    return false unless (node.opcode? and node.opcode == 0x800d)
+    node = nodes[index - num_args - 4]
+    return false unless (node.int? and node.int == nodes[index].next_offset)
+    return true
+  end
+  def reduce_call(procedure, nodes, index, opcode, name)
+    next_offset = nodes[index].next_offset
+
+    procedure_name = nodes[index - 1].procedure_name
+    num_args = nodes[index - 2].int
+    exprs = []
+    num_args.times do |i|
+      exprs.push nodes[index - num_args - 2 + i].expr_str
+    end
+
+    offset = nodes[index - num_args - 4].offset
+
+    str = procedure_name
+    if num_args > 0
+      str += "(" + exprs.join(", ") + ")"
+    elsif num_args == 0
+      str += "()"
+    end
+
+    node = CallExpressionNode.new(offset, next_offset, str)
+    num_nodes = num_args + 5
+    nodes[index - num_nodes + 1, num_nodes] = node
+  end
+
+
+  # Returns whether the give list of opcodes is found in the nodes list at
+  # the specified index.  The index is the index where the *last* element
+  # of the list should occur, i.e. the search is performed backwards.
+  def match?(nodes, index, opcodes)
+    return false if index < (opcodes.size - 1)
+    opcodes.size.times do |i|
+      node = nodes[index - i]
+      return false unless node.opcode? and node.opcode == opcodes[-i - 1]
+    end
+    return true
+  end
+
+  def can_reduce_return(procedure, nodes, index, opcode, name)
+    ops = procedure.critical? ? @return_opcodes_critical : @return_opcodes
+    return false if index < ops.size
+    return false unless nodes[index - ops.size].expression?
+    return match?(nodes, index, ops)
+  end
+  def reduce_return(procedure, nodes, index, opcode, name)
+    ops = procedure.critical? ? @return_opcodes_critical : @return_opcodes
+    next_offset = nodes[index].next_offset
+    offset = nodes[index - ops.size].offset
+
+    expr_node = nodes[index - ops.size]
+
+    str = "return(#{expr_node.expr_str});"
+
+    node = StatementNode.new(offset, next_offset, str)
+    nodes[index - ops.size, ops.size + 1] = node
+  end
+
+
+  def can_reduce_void(procedure, nodes, index, opcode, name)
+    return false if index < 1
+    return false unless nodes[index - 1].expression?
+    return true
+  end
+  def reduce_void(procedure, nodes, index, opcode, name)
+    next_offset = nodes[index].next_offset
+    offset = nodes[index - 1].offset
+
+    expr_node = nodes[index - 1]
+
+    if expr_node.call_expression?
+      str = "call #{expr_node.expr_str};"
+    else
+      str = expr_node.expr_str + ";"
+    end
+
+    node = StatementNode.new(offset, next_offset, str)
+    nodes[index - 1, 2] = node
+  end
+
+
+  def can_reduce_store_var(procedure, nodes, index, opcode, name)
+    return false if index < 2
+    return false unless nodes[index - 1].has_value?
+    return false unless nodes[index - 2].expression?
+    return true
+  end
+  def reduce_store_var(procedure, nodes, index, opcode, name)
+    next_offset = nodes[index].next_offset
+    offset = nodes[index - 2].offset
+
+    var_node = nodes[index - 1]
+    val_node = nodes[index - 2]
+
+    if opcode    == 0x8013
+      var_name = var_node.script_var_name
+    elsif opcode == 0x8015
+      var_name = var_node.label
+    elsif opcode == 0x8031
+      var_name = var_node.local_var_name
+    end
+
+    str = "#{var_name} := #{val_node.expr_str};"
+    node = StatementNode.new(offset, next_offset, str)
+    nodes[index - 2, 3] = node
+  end
+
+
+  def can_reduce_fetch_var(procedure, nodes, index, opcode, name)
+    return false if index < 1
+    return false unless nodes[index - 1].has_value?
+    return true
+  end
+  def reduce_fetch_var(procedure, nodes, index, opcode, name)
+    next_offset = nodes[index].next_offset
+    offset = nodes[index - 1].offset
+
+    var_node = nodes[index - 1]
+
+    var_name = ""
+    if opcode == 0x8012
+      var_name = var_node.script_var_name
+    elsif opcode == 0x8014
+      var_name = var_node.label
+    elsif opcode == 0x8032
+      var_name = var_node.local_var_name
+    end
+
+    node = ExpressionNode.new(offset, next_offset, var_name)
+    nodes[index - 1, 2] = node
+  end
+
+
+  def can_reduce_prefix(procedure, nodes, index, opcode, name,
+                        ret_type, params = "", flags = nil)
+    return false if index < params.length
+    return false unless @valid_prefix_ret.include?(ret_type)
+    return false if (flags == UMINUS and params.length != 1)
+    params.unpack("a" * params.length).each do |param|
+      return false unless @valid_prefix_param.include?(param)
+    end
+    params.length.times do |i|
+      return false unless nodes[index - i - 1].expression?
+    end
+    return true
+  end
+  def reduce_prefix(procedure, nodes, index, opcode, name,
+                    ret_type, params = "", flags = nil)
+    # split params into array
+    params = params.unpack("a" * params.length)
+
+    next_offset = nodes[index].next_offset
+    offset = nodes[index - params.length].offset
+
+    # extract param nodes
+    compound_args = false
+    args = Array.new
+    i = index - params.length
+    params.each do |param|
+      node = nodes[i]
+      compound_args = true if node.compound_expression?
+      if param == PROCEDURE and node.procedure_name?
+        args.push("@" + node.procedure_name)
+      else #  param == EXPRESSION
+        args.push(node.expr_str)
+      end
+      i += 1
+    end
+
+    # create and insert new node
+    if flags == UMINUS
+      str = "#{name}#{args[0]}"
+    elsif flags == NO_PAREN and not compound_args
+      str = "#{name} #{args.join(", ")}"
+    else
+      str = "#{name}(#{args.join(", ")})"
+      end
+    if ret_type == EXPRESSION
+      node = ExpressionNode.new(offset, next_offset, str)
+    elsif ret_type == FUNNY_EXPRESSION
+      node = FunnyExpressionNode.new(offset, next_offset, str)
+    else
+      node = StatementNode.new(offset, next_offset, str + ";")
+    end
+    num_nodes = params.length + 1
+    nodes[index - num_nodes + 1, num_nodes] = node
+  end
+
+  #-----------------
+  private
+
+end
+
+#####
+# This class reduces opcodes representing statements inside a procedure
+# body into statement nodes.
+#
+class StatementReducer
+  # Creates a new reducer for the given version of fallout - 1 or 2.
+  def initialize(version)
+    @rules = Rules.new
+
+    @reduce_methods = Hash.new
+    @can_reduce_methods = Hash.new
+
+    if version == 1
+      @opcodes = Fallout1Opcodes.new
+    elsif version == 2
+      @opcodes = Fallout2Opcodes.new
+    else
+      raise "unsupported fallout version `#{version}'"
+    end
+  end
+
+  # Reduces the given list of nodes under the specified procedure.
+  def reduce(procedure, nodes)
+    loop_again = true
+    while loop_again
+      loop_again = false
+
+      i = 0
+      while i < nodes.size
+        if dispatch_can_reduce(procedure, nodes, i)
+          loop_again = true
+          dispatch_reduce(procedure, nodes, i)
+        end
+
+        i += 1
+      end
+    end
+  end
+
+  #-----------------
+  private
+
+  # Returns whether the given node can be reduced.
+  def dispatch_can_reduce(procedure, nodes, i)
+    node = nodes[i]
+    return false unless node.opcode?
+    return false unless @opcodes.has_opcode?(node.opcode)
+
+    rule, name, *args = @opcodes.opcode(node.opcode)
+    can_reduce_method(rule).call(procedure, nodes, i, node.opcode, name, *args)
+  end
+
+  # Reduces the given node in the nodes list.
+  def dispatch_reduce(procedure, nodes, i)
+    node = nodes[i]
+    rule, name, *args = @opcodes.opcode(node.opcode)
+    reduce_method(rule).call(procedure, nodes, i, node.opcode, name, *args)
+  end
+
+  def can_reduce_method(rule)
+    method = @can_reduce_methods[rule]
+    if method.nil?
+      method = @rules.method(eval ":can_reduce_#{rule}")
+      @can_reduce_methods[rule] = method
+    end
+    method
+  end
+
+  def reduce_method(rule)
+    method = @reduce_methods[rule]
+    if method.nil?
+      method = @rules.method(eval ":reduce_#{rule}")
+      @reduce_methods[rule] = method
+    end
+    method
+  end
+end
+
+#####
+# Contains rules for all opcodes in the Fallout1 virtual machine.
+#
+class Fallout1Opcodes
+  include OpcodeList
+
+  def has_opcode?(op)
+    @@opcodes.has_key?(op)
+  end
+
+  def opcode(op)
+    @@opcodes[op]
+  end
+
+  @@opcodes = {
+    0x8005 => ["call", "call"],
+    0x8006 => ["callin", "callin"],
+    0x8007 => ["callwhen", "callwhen"],
+    0x8008 => ["prefix", "callstart", "S", "E"],
+    0x8009 => ["prefix", "exec", "S", "E"],
+    0x800a => ["prefix", "spawn", "S", "E"],
+    0x800b => ["prefix", "fork", "S", "E"],
+
+    0x800e => ["prefix", "exit", "S"],
+    0x800f => ["prefix", "detach", "S"],
+
+    0x8012 => ["fetch_var", "fetchsv"],
+    0x8013 => ["store_var", "storesv"],
+
+    0x8014 => ["fetch_var", "fetchev"],
+    0x8015 => ["store_var", "storeev"],
+
+    0x801a => ["void", "pop"],
+
+    0x801c => ["return", "restpc"],
+
+    0x8028 => ["indirect_call", "lookup_string_proc"],
+
+    0x802f => ["if_then", "ifthen"],
+    0x8030 => ["while_do", "whiledo"],
+    0x8031 => ["store_var", "storelv"],
+    0x8032 => ["fetch_var", "fetchlv"],
+    0x8033 => ["infix", "==",    1, NON_ASSOC],
+    0x8034 => ["infix", "!=",    1, NON_ASSOC],
+    0x8035 => ["infix", "<=",    2, NON_ASSOC],
+    0x8036 => ["infix", ">=",    2, NON_ASSOC],
+    0x8037 => ["infix", "<",     2, NON_ASSOC],
+    0x8038 => ["infix", ">",     2, NON_ASSOC],
+    0x8039 => ["infix", "+",     6, LEFT_ASSOC],
+    0x803a => ["infix", "-",     6, LEFT_ASSOC],
+    0x803b => ["infix", "*",     7, LEFT_ASSOC],
+    0x803c => ["infix", "/",     7, LEFT_ASSOC],
+    0x803d => ["infix", "%",     7, LEFT_ASSOC],
+    0x803e => ["infix", "and",   0, LEFT_ASSOC],
+    0x803f => ["infix", "or",    0, LEFT_ASSOC],
+    0x8040 => ["infix", "bwand", 5, LEFT_ASSOC],
+    0x8041 => ["infix", "bwor",  3, LEFT_ASSOC],
+    0x8042 => ["infix", "bwxor", 4, LEFT_ASSOC],
+    0x8043 => ["prefix", "bwnot", "E", "E"],
+    0x8044 => ["prefix", "floor", "E", "E"],
+    0x8045 => ["prefix", "not", "E", "E", NO_PAREN],
+    0x8046 => ["prefix", "-", "E", "E", UMINUS],
+    0x8047 => ["prefix", "wait", "S", "E"],
+    0x8048 => ["prefix", "cancel", "S", "P"],
+    0x8049 => ["prefix", "cancelall", "S"],
+    0x804a => ["prefix", "startcritical", "S"],
+    0x804b => ["prefix", "endcritical", "S"],
+    0x804c => ["prefix", "sayquit", "S"],
+    0x804d => ["prefix", "sayend", "S"],
+    0x804e => ["prefix", "saystart", "S"],
+    0x804f => ["prefix", "saystartpos", "S", "E"],
+    0x8050 => ["prefix", "sayreplytitle", "S", "E"],
+    0x8051 => ["prefix", "saygotoreply", "S", "E"],
+    0x8052 => ["prefix", "sayreply", "S", "EE"],
+    0x8053 => ["prefix", "sayoption", "S", "EP"],
+    0x8054 => ["prefix", "saymessage", "S", "EE"],
+    0x8055 => ["prefix", "sayreplywindow", "S", "EEEEE"],
+    0x8056 => ["prefix", "sayoptionwindow", "S", "EEEEE"],
+    0x8057 => ["prefix", "sayborder", "S", "EE"],
+    0x8058 => ["prefix", "sayscrollup", "S", "EEEEEE"],
+    0x8059 => ["prefix", "sayscrolldown", "S", "EEEEEE"],
+    0x805a => ["prefix", "sayspacing", "S", "E"],
+    0x805b => ["prefix", "sayoptioncolor", "S", "EEE"],
+    0x805c => ["prefix", "sayreplycolor", "S", "EEE"],
+    0x805d => ["prefix", "sayrestart", "S"],
+    0x805e => ["prefix", "saygetlastpos", "E"],
+    0x805f => ["prefix", "sayreplyflags", "S", "E"],
+    0x8060 => ["prefix", "sayoptionflags", "S", "E"],
+    0x8061 => ["prefix", "saymessagetimeout", "S", "E"],
+    0x8062 => ["prefix", "createwin", "S", "EEEEE"],
+    0x8063 => ["prefix", "deletewin", "S", "E"],
+    0x8064 => ["prefix", "selectwin", "S", "E"],
+    0x8065 => ["prefix", "resizewin", "S", "EEEEE"],
+    0x8066 => ["prefix", "scalewin", "S", "EEEEE"],
+    0x8067 => ["prefix", "showwin", "S"],
+    0x8068 => ["prefix", "fillwin", "S", "EEE"],
+    0x8069 => ["prefix", "fillrect", "S", "EEEEEEE"],
+    0x806a => ["prefix", "fillwin3x3", "S", "E"],
+    0x806b => ["prefix", "display", "S", "E"],
+    0x806c => ["prefix", "displaygfx", "S", "EEEEE"],
+    0x806d => ["prefix", "displayraw", "S", "E"],
+    0x806e => ["prefix", "loadpalettetable", "S", "E"],
+    0x806f => ["prefix", "fadein", "S", "E"],
+    0x8070 => ["prefix", "fadeout", "S", "E"],
+    0x8071 => ["prefix", "gotoxy", "S", "EE"],
+    0x8072 => ["prefix", "print", "S", "E"],
+    0x8073 => ["prefix", "format", "S", "EEEEEE"],
+    0x8074 => ["prefix", "printrect", "S", "EEE"],
+    0x8075 => ["prefix", "setfont", "S", "E"],
+    0x8076 => ["prefix", "settextflags", "S", "E"],
+    0x8077 => ["prefix", "settextcolor", "S", "EEE"],
+    0x8078 => ["prefix", "sethighlightcolor", "S", "EEE"],
+    0x8079 => ["prefix", "stopmovie", "S"],
+    0x807a => ["prefix", "playmovie", "S", "E"],
+    0x807b => ["prefix", "movieflags", "S", "E"],
+    0x807c => ["prefix", "playmovierect", "S", "EEEEE"],
+    0x807d => ["prefix", "playmoviealpha", "S", "EE"],
+    0x807e => ["prefix", "playmoviealpharect", "S", "EEEEEE"],
+    #######################################################0x807f => ["addregion", "addregion"],
+    0x8080 => ["prefix", "addregionflag", "S", "EE"],
+    0x8081 => ["prefix", "addregionproc", "S", "EEEEE"],
+    0x8082 => ["prefix", "addregionrightproc", "S", "EEE"],
+    0x8083 => ["prefix", "deleteregion", "S", "E"],
+    0x8084 => ["prefix", "activateregion", "S", "EE"],
+    0x8085 => ["prefix", "checkregion", "E", "E"],
+    0x8086 => ["prefix", "addbutton", "S", "EEEEE"],
+    0x8087 => ["prefix", "addbuttontext", "S", "EE"],
+    0x8088 => ["prefix", "addbuttonflag", "S", "EE"],
+    0x8089 => ["prefix", "addbuttongfx", "S", "EEEE"],
+    0x808a => ["prefix", "addbuttonproc", "S", "EEEEE"],
+    0x808b => ["prefix", "addbuttonrightproc", "S", "EEE"],
+    0x808c => ["prefix", "deletebutton", "S", "E"],
+    0x808d => ["prefix", "hidemouse", "S"],
+    0x808e => ["prefix", "showmouse", "S"],
+    0x808f => ["prefix", "mouseshape", "S", "EEE"],
+    0x8090 => ["prefix", "refreshmouse", "S", "E"],
+    0x8091 => ["prefix", "setglobalmousefunc", "S", "EEEE"],
+    0x8092 => ["prefix", "addnamedevent", "S", "EE"],
+    0x8093 => ["prefix", "addnamedhandler", "S", "EE"],
+    0x8094 => ["prefix", "clearnamed", "S", "E"],
+    0x8095 => ["prefix", "signalnamed", "S", "E"],
+    0x8096 => ["prefix", "addkey", "S", "EE"],
+    0x8097 => ["prefix", "deletekey", "S", "E"],
+    0x8098 => ["prefix", "soundplay", "E", "EE"],
+    0x8099 => ["prefix", "soundpause", "S", "E"],
+    0x809a => ["prefix", "soundresume", "S", "E"],
+    0x809b => ["prefix", "soundstop", "S", "E"],
+    0x809c => ["prefix", "soundrewind", "S", "E"],
+    0x809d => ["prefix", "sounddelete", "S", "E"],
+    0x809e => ["prefix", "setoneoptpause", "S", "E"],
+    0x809f => ["prefix", "selectfilelist", "E", "EE"],
+    0x80a0 => ["prefix", "tokenize", "E", "EEE"],
+    0x80a1 => ["prefix", "op_give_exp_points", "S", "E"],
+    0x80a2 => ["prefix", "op_scr_return", "S", "E"],    # stimpack.ssl has 0
+    0x80a3 => ["prefix", "op_play_sfx", "S", "E"],
+    0x80a4 => ["prefix", "op_obj_name", "E", "E"],
+    0x80a5 => ["prefix", "op_sfx_build_open_name", "E", "E"],
+    0x80a6 => ["prefix", "op_get_pc_stat", "E", "E"],
+    0x80a7 => ["prefix", "op_tile_contains_pid_object", "E", "EEE"],
+    0x80a8 => ["prefix", "op_set_map_start", "S", "EEEE"],
+    0x80a9 => ["prefix", "op_override_map_start", "S", "EEEE"],
+    0x80aa => ["prefix", "op_has_skill", "E", "EE"],
+    0x80ab => ["prefix", "op_using_skill", "E", "EE"],
+    0x80ac => ["prefix", "op_roll_vs_skill", "E", "EEE"],
+    0x80ad => ["prefix", "op_skill_contest", "E", "EEE"],
+    0x80ae => ["prefix", "op_do_check", "E", "EEE"],
+    0x80af => ["prefix", "op_success", "E", "E"],
+    0x80b0 => ["prefix", "op_critical", "E", "E"],
+    0x80b1 => ["prefix", "op_how_much", "E", "E"],
+    0x80b2 => ["prefix", "op_mark_area_known", "S", "EEE"],
+    0x80b3 => ["prefix", "op_reaction_influence", "E", "EEE"],
+    0x80b4 => ["prefix", "op_random", "E", "EE"],
+    0x80b5 => ["prefix", "op_roll_dice", "E", "EE"],
+    0x80b6 => ["prefix", "op_move_to", "X", "EEE"],    # DIFF
+    0x80b7 => ["prefix", "op_create_object", "E", "EEEE"],
+    0x80b8 => ["prefix", "op_display_msg", "S", "E"],
+    0x80b9 => ["prefix", "op_script_overrides", "S"],
+    0x80ba => ["prefix", "op_obj_is_carrying_obj", "E", "EE"],
+    0x80bb => ["prefix", "op_tile_contains_obj_pid", "E", "EEE"],
+    0x80bc => ["prefix", "op_self_obj", "E"],
+    0x80bd => ["prefix", "op_source_obj", "E"],
+    0x80be => ["prefix", "op_target_obj", "E"],
+    0x80bf => ["prefix", "op_dude_obj", "E"],
+    0x80c0 => ["prefix", "op_obj_being_used_with", "E"],
+    0x80c1 => ["prefix", "op_local_var", "E", "E"],
+    0x80c2 => ["prefix", "op_set_local_var", "S", "EE"],
+    0x80c3 => ["prefix", "op_map_var", "E", "E"],
+    0x80c4 => ["prefix", "op_set_map_var", "S", "EE"],
+    0x80c5 => ["prefix", "op_global_var", "E", "E"],
+    0x80c6 => ["prefix", "op_set_global_var", "S", "EE"],
+    0x80c7 => ["prefix", "op_script_action", "E"],
+    0x80c8 => ["prefix", "op_obj_type", "E", "E"],
+    0x80c9 => ["prefix", "op_item_subtype", "E", "E"],
+    0x80ca => ["prefix", "op_get_critter_stat", "E", "EE"],
+    0x80cb => ["prefix", "op_set_critter_stat", "S", "EEE"],
+    0x80cc => ["prefix", "op_animate_stand_obj", "S", "E"],
+    0x80cd => ["prefix", "op_animate_stand_reverse_obj", "S", "E"],
+    0x80ce => ["prefix", "op_animate_move_obj_to_tile", "S", "EEE"],
+    0x80cf => ["prefix", "op_tile_in_tile_rect", "E", "EEEEE"],
+    0x80d0 => ["prefix", "op_attack", "S", "EEEEEEEE"],
+    0x80d1 => ["prefix", "maybe_80d1", "S"],
+    0x80d2 => ["prefix", "op_tile_distance", "E", "EE"],
+    0x80d3 => ["prefix", "op_tile_distance_objs", "E", "EE"],
+    0x80d4 => ["prefix", "op_tile_num", "E", "E"],
+    0x80d5 => ["prefix", "op_tile_num_in_direction", "E", "EEE"],
+    0x80d6 => ["prefix", "op_pickup_obj", "S", "E"],
+    0x80d7 => ["prefix", "op_drop_obj", "S", "E"],
+    0x80d8 => ["prefix", "op_add_obj_to_inven", "S", "EE"],
+    0x80d9 => ["prefix", "op_rm_obj_from_inven", "S", "EE"],
+    0x80da => ["prefix", "op_wield_obj_critter", "S", "EE"],
+    0x80db => ["prefix", "op_use_obj", "S", "E"],
+    0x80dc => ["prefix", "op_obj_can_see_obj", "E", "EE"],
+    0x80dd => ["prefix", "op_attack2", "S", "EEEEEEEE"],
+    0x80de => ["prefix", "op_start_gdialog", "S", "EEEEE"],  ## sammy.ssl , gatedemo.ssl has 4
+    0x80df => ["prefix", "maybe_op_end_gdialog", "S"],
+    0x80e0 => ["prefix", "op_dialog_reaction", "S", "E"],
+    0x80e1 => ["prefix", "op_metarule3", "E", "EEEE"],
+    0x80e2 => ["prefix", "op_set_map_music", "S", "EE"],
+    0x80e3 => ["prefix", "op_set_obj_invisibility", "S", "EE"],
+    0x80e4 => ["prefix", "op_load_map", "S", "EE"],
+    0x80e5 => ["prefix", "op_wm_area_set_pos", "S", "EEE"],
+    0x80e6 => ["prefix", "op_set_exit_grids", "S", "EEE"],   # DIFF
+    0x80e7 => ["prefix", "op_anim_busy", "E", "E"],
+    0x80e8 => ["prefix", "op_critter_heal", "X", "EE"],
+    0x80e9 => ["prefix", "op_set_light_level", "S", "E"],
+    0x80ea => ["prefix", "op_game_time", "E"],
+    0x80eb => ["prefix", "maybe_80eb", "E"],
+    0x80ec => ["prefix", "op_elevation", "E", "E"],
+    0x80ed => ["prefix", "op_kill_critter", "S", "EE"],
+    0x80ee => ["prefix", "op_kill_critter_type", "S", "EE"],
+    0x80ef => ["prefix", "op_critter_damage", "S", "EEE"],  # glow4w~1.ssl , prison.ssl has 2
+    0x80f0 => ["prefix", "op_add_timer_event", "S", "EEE"],
+    0x80f1 => ["prefix", "op_rm_timer_event", "S", "E"],
+    0x80f2 => ["prefix", "op_game_ticks", "E", "E"],
+    0x80f3 => ["prefix", "op_has_trait", "E", "EEE"],
+    0x80f4 => ["prefix", "op_destroy_object", "S", "E"],
+    0x80f5 => ["prefix", "op_obj_can_hear_obj", "E", "EE"],
+    0x80f6 => ["prefix", "op_game_time_hour", "E"],
+    0x80f7 => ["prefix", "op_fixed_param", "E"],
+    0x80f8 => ["prefix", "op_tile_is_visible", "E", "E"],
+    0x80f9 => ["prefix", "maybe_talk", "S"],
+    0x80fa => ["prefix", "op_action_being_used", "E"],
+    0x80fb => ["prefix", "op_critter_state", "E", "E"],
+    0x80fc => ["prefix", "op_game_time_advance", "S", "E"],
+    0x80fd => ["prefix", "op_radiation_inc", "S", "EE"],
+    0x80fe => ["prefix", "op_radiation_dec", "S", "EE"],
+    0x80ff => ["prefix", "op_critter_attempt_placement", "X", "EEE"],  # DIFF
+    0x8100 => ["prefix", "op_obj_pid", "E", "E"],
+    0x8101 => ["prefix", "op_cur_map_index", "E"],
+    0x8102 => ["prefix", "op_critter_add_trait", "X", "EEEE"],            ######## ??? TODO S or E ??  - abel.int and acbrahmn.int treat differently
+    0x8103 => ["prefix", "op_critter_rm_trait", "S", "EEEE"],
+    0x8104 => ["prefix", "op_proto_data", "E", "EE"],
+    0x8105 => ["prefix", "op_msg_string", "E", "EE"],
+    0x8106 => ["prefix", "op_critter_inven_obj", "E", "EE"],
+    0x8107 => ["prefix", "op_obj_set_light_level", "S", "EEE"],
+    0x8108 => ["prefix", "maybe_8108", "S"],
+    0x8109 => ["prefix", "op_inven_cmds", "E"],             # DIFF townmap.ssl has 0
+    0x810a => ["prefix", "op_float_msg", "S", "EEE"],
+    0x810b => ["prefix", "op_metarule", "X", "EE"],         # DIFF
+    0x810c => ["prefix", "op_anim", "S", "EEE"],
+    0x810d => ["prefix", "op_obj_carrying_pid_obj", "E", "EE"],
+    0x810e => ["prefix", "op_reg_anim_func", "S", "EE"],
+    0x810f => ["prefix", "op_reg_anim_animate", "S", "EEE"],
+    0x8110 => ["prefix", "op_reg_anim_animate_reverse", "S", "EEE"],
+    0x8111 => ["prefix", "op_reg_anim_obj_move_to_obj", "S", "EEE"],
+    0x8112 => ["prefix", "op_reg_anim_obj_run_to_obj", "S", "EEE"],
+    0x8113 => ["prefix", "op_reg_anim_obj_move_to_tile", "S", "EEE"],
+    0x8114 => ["prefix", "op_reg_anim_obj_run_to_tile", "S", "EEE"],
+    0x8115 => ["prefix", "op_play_gmovie", "S", "E"],
+    0x8116 => ["prefix", "op_add_mult_objs_to_inven", "S", "EEE"],
+    0x8117 => ["prefix", "op_rm_mult_objs_from_inven", "E", "EEE"],
+    0x8118 => ["prefix", "op_get_month", "E"],
+    0x8119 => ["prefix", "op_get_day", "E"],
+    0x811a => ["prefix", "op_explosion", "S", "EEE"],
+    0x811b => ["prefix", "maybe_811b", "E"],
+    0x811c => ["prefix", "maybe_start_dialog", "S"],
+    0x811d => ["prefix", "maybe_close_dialog", "S"],
+    0x811e => ["prefix", "op_gsay_reply", "S", "EE"],
+    0x811f => ["prefix", "op_gsay_option", "S", "EEEE"],
+    0x8120 => ["prefix", "op_gsay_message", "S", "EEE"],
+    0x8121 => ["prefix", "op_giq_option", "S", "EEEPE"],
+    0x8122 => ["prefix", "op_poison", "S", "EE"],
+    0x8123 => ["prefix", "op_get_poison", "E", "E"],
+    0x8124 => ["prefix", "op_party_add", "S", "E"],
+    0x8125 => ["prefix", "op_party_remove", "S", "E"],
+    0x8126 => ["prefix", "op_reg_anim_animate_forever", "S", "EE"],
+    0x8127 => ["prefix", "op_critter_injure", "S", "EE"],
+    0x8128 => ["prefix", "maybe_in_battle", "E"],
+    0x8129 => ["prefix", "op_gdialog_barter", "S", "E"],
+    0x812a => ["prefix", "maybe_ini_game_difficulty", "E"],
+    0x812b => ["prefix", "maybe_ini_running_burning_guy", "E"],
+    0x812c => ["prefix", "maybe_812c", "S"],
+    0x812d => ["prefix", "op_obj_is_locked", "E", "E"],
+    0x812e => ["prefix", "op_obj_lock", "S", "E"],
+    0x812f => ["prefix", "op_obj_unlock", "S", "E"],
+    0x8130 => ["prefix", "op_obj_is_open", "E", "E"],
+    0x8131 => ["prefix", "op_obj_open", "S", "E"],
+    0x8132 => ["prefix", "op_obj_close", "S", "E"],
+    0x8133 => ["prefix", "maybe_lock_input", "S"],
+    0x8134 => ["prefix", "maybe_unlock_input", "S"],
+    0x8135 => ["prefix", "maybe_8135", "E"],
+    0x8136 => ["prefix", "op_gfade_out", "S", "E"],
+    0x8137 => ["prefix", "op_gfade_in", "S", "E"],
+    0x8138 => ["prefix", "op_item_caps_total", "E", "E"],
+    0x8139 => ["prefix", "op_item_caps_adjust", "X", "EE"],   # DIFF
+    0x813a => ["prefix", "op_anim_action_frame", "E", "EE"],
+    0x813b => ["prefix", "op_reg_anim_play_sfx", "S", "EEE"],
+    0x813c => ["prefix", "op_critter_mod_skill", "S", "EEE"],
+    0x813d => ["prefix", "op_sfx_build_char_name", "E", "EEE"],
+    0x813e => ["prefix", "op_sfx_build_ambient_name", "E", "E"],
+    0x813f => ["prefix", "op_sfx_build_interface_name", "E", "E"],
+    0x8140 => ["prefix", "op_sfx_build_item_name", "E", "E"],
+    0x8141 => ["prefix", "op_sfx_build_weapon_name", "E", "EEEE"],
+    0x8142 => ["prefix", "op_sfx_build_scenery_name", "E", "EEE"],
+    0x8143 => ["prefix", "op_attack_setup", "S", "EE"],
+    0x8144 => ["prefix", "op_destroy_mult_objs", "E", "EE"],
+    0x8145 => ["prefix", "op_use_obj_on_obj", "S", "EE"],
+    0x8146 => ["prefix", "maybe_credits", "S"],
+    0x8147 => ["prefix", "op_move_obj_inven_to_obj", "S", "EE"],
+    0x8148 => ["prefix", "maybe_8148", "S"],
+    0x8149 => ["prefix", "op_obj_art_fid", "E", "E"],
+    0x814a => ["prefix", "op_art_anim", "E", "E"],
+    0x814b => ["prefix", "op_party_member_obj", "E", "E"],
+    0x814c => ["prefix", "op_rotation_to_tile", "E", "EE"],
+    0x814d => ["prefix", "op_jam_lock", "S", "E"],
+    0x814e => ["prefix", "op_gdialog_set_barter_mod", "S", "E"],
+    0x814f => ["prefix", "maybe_ini_get_combat_difficulty", "E"],
+    0x8150 => ["prefix", "op_obj_on_screen", "E", "E"],
+    0x8151 => ["prefix", "op_critter_is_fleeing", "E", "E"],
+    0x8152 => ["prefix", "op_critter_set_flee_state", "S", "EE"],
+    0x8153 => ["prefix", "maybe_stop_battle", "S"],
+    0x8154 => ["prefix", "op_debug_msg", "S", "E"],
+    0x8155 => ["prefix", "op_critter_stop_attacking", "S", "E"],
+  }
+end
+
+#####
+# Contains rules for all opcodes in the Fallout2 virtual machine.
+#
+class Fallout2Opcodes
+  include OpcodeList
+
+  def has_opcode?(op)
+    @@opcodes.has_key?(op)
+  end
+
+  def opcode(op)
+    @@opcodes[op]
+  end
+
+    @@opcodes = {
+    0x8005 => ["call", "call"],
+    0x8006 => ["callin", "callin"],
+    0x8007 => ["callwhen", "callwhen"],
+    0x8008 => ["prefix", "callstart", "S", "E"],
+    0x8009 => ["prefix", "exec", "S", "E"],
+    0x800a => ["prefix", "spawn", "S", "E"],
+    0x800b => ["prefix", "fork", "S", "E"],
+
+    0x800e => ["prefix", "exit", "S"],
+    0x800f => ["prefix", "detach", "S"],
+
+    0x8012 => ["fetch_var", "fetchsv"],
+    0x8013 => ["store_var", "storesv"],
+
+    0x8014 => ["fetch_var", "fetchev"],
+    0x8015 => ["store_var", "storeev"],
+
+    0x801a => ["void", "pop"],
+
+    0x801c => ["return", "restpc"],
+
+    0x8028 => ["indirect_call", "lookup_string_proc"],
+
+    0x802f => ["if_then", "ifthen"],
+    0x8030 => ["while_do", "whiledo"],
+    0x8031 => ["store_var", "storelv"],
+    0x8032 => ["fetch_var", "fetchlv"],
+    0x8033 => ["infix", "==",    1, NON_ASSOC],
+    0x8034 => ["infix", "!=",    1, NON_ASSOC],
+    0x8035 => ["infix", "<=",    2, NON_ASSOC],
+    0x8036 => ["infix", ">=",    2, NON_ASSOC],
+    0x8037 => ["infix", "<",     2, NON_ASSOC],
+    0x8038 => ["infix", ">",     2, NON_ASSOC],
+    0x8039 => ["infix", "+",     6, LEFT_ASSOC],
+    0x803a => ["infix", "-",     6, LEFT_ASSOC],
+    0x803b => ["infix", "*",     7, LEFT_ASSOC],
+    0x803c => ["infix", "/",     7, LEFT_ASSOC],
+    0x803d => ["infix", "%",     7, LEFT_ASSOC],
+    0x803e => ["infix", "and",   0, LEFT_ASSOC],
+    0x803f => ["infix", "or",    0, LEFT_ASSOC],
+    0x8040 => ["infix", "bwand", 5, LEFT_ASSOC],
+    0x8041 => ["infix", "bwor",  3, LEFT_ASSOC],
+    0x8042 => ["infix", "bwxor", 4, LEFT_ASSOC],
+    0x8043 => ["prefix", "bwnot", "E", "E"],
+    0x8044 => ["prefix", "floor", "E", "E"],
+    0x8045 => ["prefix", "not", "E", "E", NO_PAREN],
+    0x8046 => ["prefix", "-", "E", "E", UMINUS],
+    0x8047 => ["prefix", "wait", "S", "E"],
+    0x8048 => ["prefix", "cancel", "S", "P"],
+    0x8049 => ["prefix", "cancelall", "S"],
+    0x804a => ["prefix", "startcritical", "S"],
+    0x804b => ["prefix", "endcritical", "S"],
+    0x804c => ["prefix", "sayquit", "S"],
+    0x804d => ["prefix", "sayend", "S"],
+    0x804e => ["prefix", "saystart", "S"],
+    0x804f => ["prefix", "saystartpos", "S", "E"],
+    0x8050 => ["prefix", "sayreplytitle", "S", "E"],
+    0x8051 => ["prefix", "saygotoreply", "S", "E"],
+    0x8052 => ["prefix", "sayreply", "S", "EE"],
+    0x8053 => ["prefix", "sayoption", "S", "EP"],
+    0x8054 => ["prefix", "saymessage", "S", "EE"],
+    0x8055 => ["prefix", "sayreplywindow", "S", "EEEEE"],
+    0x8056 => ["prefix", "sayoptionwindow", "S", "EEEEE"],
+    0x8057 => ["prefix", "sayborder", "S", "EE"],
+    0x8058 => ["prefix", "sayscrollup", "S", "EEEEEE"],
+    0x8059 => ["prefix", "sayscrolldown", "S", "EEEEEE"],
+    0x805a => ["prefix", "sayspacing", "S", "E"],
+    0x805b => ["prefix", "sayoptioncolor", "S", "EEE"],
+    0x805c => ["prefix", "sayreplycolor", "S", "EEE"],
+    0x805d => ["prefix", "sayrestart", "S"],
+    0x805e => ["prefix", "saygetlastpos", "E"],
+    0x805f => ["prefix", "sayreplyflags", "S", "E"],
+    0x8060 => ["prefix", "sayoptionflags", "S", "E"],
+    0x8061 => ["prefix", "saymessagetimeout", "S", "E"],
+    0x8062 => ["prefix", "createwin", "S", "EEEEE"],
+    0x8063 => ["prefix", "deletewin", "S", "E"],
+    0x8064 => ["prefix", "selectwin", "S", "E"],
+    0x8065 => ["prefix", "resizewin", "S", "EEEEE"],
+    0x8066 => ["prefix", "scalewin", "S", "EEEEE"],
+    0x8067 => ["prefix", "showwin", "S"],
+    0x8068 => ["prefix", "fillwin", "S", "EEE"],
+    0x8069 => ["prefix", "fillrect", "S", "EEEEEEE"],
+    0x806a => ["prefix", "fillwin3x3", "S", "E"],
+    0x806b => ["prefix", "display", "S", "E"],
+    0x806c => ["prefix", "displaygfx", "S", "EEEEE"],
+    0x806d => ["prefix", "displayraw", "S", "E"],
+    0x806e => ["prefix", "loadpalettetable", "S", "E"],
+    0x806f => ["prefix", "fadein", "S", "E"],
+    0x8070 => ["prefix", "fadeout", "S", "E"],
+    0x8071 => ["prefix", "gotoxy", "S", "EE"],
+    0x8072 => ["prefix", "print", "S", "E"],
+    0x8073 => ["prefix", "format", "S", "EEEEEE"],
+    0x8074 => ["prefix", "printrect", "S", "EEE"],
+    0x8075 => ["prefix", "setfont", "S", "E"],
+    0x8076 => ["prefix", "settextflags", "S", "E"],
+    0x8077 => ["prefix", "settextcolor", "S", "EEE"],
+    0x8078 => ["prefix", "sethighlightcolor", "S", "EEE"],
+    0x8079 => ["prefix", "stopmovie", "S"],
+    0x807a => ["prefix", "playmovie", "S", "E"],
+    0x807b => ["prefix", "movieflags", "S", "E"],
+    0x807c => ["prefix", "playmovierect", "S", "EEEEE"],
+    0x807d => ["prefix", "playmoviealpha", "S", "EE"],
+    0x807e => ["prefix", "playmoviealpharect", "S", "EEEEEE"],
+    ##################################################################################################0x807f => ["prefix", "addregion", "X"],
+    0x8080 => ["prefix", "addregionflag", "S", "EE"],
+    0x8081 => ["prefix", "addregionproc", "S", "EEEEE"],
+    0x8082 => ["prefix", "addregionrightproc", "S", "EEE"],
+    0x8083 => ["prefix", "deleteregion", "S", "E"],
+    0x8084 => ["prefix", "activateregion", "S", "EE"],
+    0x8085 => ["prefix", "checkregion", "E", "E"],
+    0x8086 => ["prefix", "addbutton", "S", "EEEEE"],
+    0x8087 => ["prefix", "addbuttontext", "S", "EE"],
+    0x8088 => ["prefix", "addbuttonflag", "S", "EE"],
+    0x8089 => ["prefix", "addbuttongfx", "S", "EEEE"],
+    0x808a => ["prefix", "addbuttonproc", "S", "EEEEE"],
+    0x808b => ["prefix", "addbuttonrightproc", "S", "EEE"],
+    0x808c => ["prefix", "deletebutton", "S", "E"],
+    0x808d => ["prefix", "hidemouse", "S"],
+    0x808e => ["prefix", "showmouse", "S"],
+    0x808f => ["prefix", "mouseshape", "S", "EEE"],
+    0x8090 => ["prefix", "refreshmouse", "S", "E"],
+    0x8091 => ["prefix", "setglobalmousefunc", "S", "EEEE"],
+    0x8092 => ["prefix", "addnamedevent", "S", "EE"],
+    0x8093 => ["prefix", "addnamedhandler", "S", "EE"],
+    0x8094 => ["prefix", "clearnamed", "S", "E"],
+    0x8095 => ["prefix", "signalnamed", "S", "E"],
+    0x8096 => ["prefix", "addkey", "S", "EE"],
+    0x8097 => ["prefix", "deletekey", "S", "E"],
+    0x8098 => ["prefix", "soundplay", "E", "EE"],
+    0x8099 => ["prefix", "soundpause", "S", "E"],
+    0x809a => ["prefix", "soundresume", "S", "E"],
+    0x809b => ["prefix", "soundstop", "S", "E"],
+    0x809c => ["prefix", "soundrewind", "S", "E"],
+    0x809d => ["prefix", "sounddelete", "S", "E"],
+    0x809e => ["prefix", "setoneoptpause", "S", "E"],
+    0x809f => ["prefix", "selectfilelist", "E", "EE"],
+    0x80a0 => ["prefix", "tokenize", "E", "EEE"],
+    0x80a1 => ["prefix", "op_give_exp_points", "S", "E"],
+    0x80a2 => ["prefix", "op_scr_return", "S", "E"],
+    0x80a3 => ["prefix", "op_play_sfx", "S", "E"],
+    0x80a4 => ["prefix", "op_obj_name", "E", "E"],
+    0x80a5 => ["prefix", "op_sfx_build_open_name", "E", "EE"],
+    0x80a6 => ["prefix", "op_get_pc_stat", "E", "E"],
+    0x80a7 => ["prefix", "op_tile_contains_pid_obj", "E", "EEE"],
+    0x80a8 => ["prefix", "op_set_map_start", "S", "EEEE"],
+    0x80a9 => ["prefix", "op_override_map_start", "S", "EEEE"],
+    0x80aa => ["prefix", "op_has_skill", "E", "EE"],
+    0x80ab => ["prefix", "op_using_skill", "E", "EE"],
+    0x80ac => ["prefix", "op_roll_vs_skill", "E", "EEE"],
+    0x80ad => ["prefix", "op_skill_contest", "E", "EEE"],
+    0x80ae => ["prefix", "op_do_check", "E", "EEE"],
+    0x80af => ["prefix", "op_is_success", "E", "E"],
+    0x80b0 => ["prefix", "op_is_critical", "E", "E"],
+    0x80b1 => ["prefix", "op_how_much", "E"],
+    0x80b2 => ["prefix", "op_mark_area_known", "S", "EEE"],
+    0x80b3 => ["prefix", "op_reaction_influence", "E", "EEE"],
+    0x80b4 => ["prefix", "op_random", "E", "EE"],
+    0x80b5 => ["prefix", "op_roll_dice", "E", "EE"],
+    0x80b6 => ["prefix", "op_move_to", "E", "EEE"],
+    0x80b7 => ["prefix", "op_create_object_sid", "E", "EEEE"],
+    0x80b8 => ["prefix", "op_display_msg", "S", "E"],
+    0x80b9 => ["prefix", "op_script_overrides", "S"],
+    0x80ba => ["prefix", "op_obj_is_carrying_obj_pid", "E", "EE"],
+    0x80bb => ["prefix", "op_tile_contains_obj_pid", "E", "EEE"],
+    0x80bc => ["prefix", "op_self_obj", "E"],
+    0x80bd => ["prefix", "op_source_obj", "E"],
+    0x80be => ["prefix", "op_target_obj", "E"],
+    0x80bf => ["prefix", "op_dude_obj", "E"],
+    0x80c0 => ["prefix", "op_obj_being_used_with", "E"],
+    0x80c1 => ["prefix", "op_local_var", "E", "E"],
+    0x80c2 => ["prefix", "op_set_local_var", "S", "EE"],
+    0x80c3 => ["prefix", "op_map_var", "E", "E"],
+    0x80c4 => ["prefix", "op_set_map_var", "S", "EE"],
+    0x80c5 => ["prefix", "op_global_var", "E", "E"],
+    0x80c6 => ["prefix", "op_set_global_var", "S", "EE"],
+    0x80c7 => ["prefix", "op_script_action", "E"],
+    0x80c8 => ["prefix", "op_obj_type", "E", "E"],
+    0x80c9 => ["prefix", "op_obj_item_subtype", "E", "E"],
+    0x80ca => ["prefix", "op_get_critter_stat", "E", "EE"],
+    0x80cb => ["prefix", "op_set_critter_stat", "E", "EEE"],
+    0x80cc => ["prefix", "op_animate_stand_obj", "S", "E"],
+    0x80cd => ["prefix", "op_animate_stand_reverse_obj", "S", "E"],
+    0x80ce => ["prefix", "op_animate_move_obj_to_tile", "S", "EEE"],
+    0x80cf => ["prefix", "op_tile_in_tile_rect", "E", "EEEEE"],
+    0x80d0 => ["prefix", "op_attack_complex", "S", "EEEEEEEE"],
+    0x80d1 => ["prefix", "op_make_daytime", "S"],
+    0x80d2 => ["prefix", "op_tile_distance", "E", "EE"],
+    0x80d3 => ["prefix", "op_tile_distance_objs", "E", "EE"],
+    0x80d4 => ["prefix", "op_tile_num", "E", "E"],
+    0x80d5 => ["prefix", "op_tile_num_in_direction", "E", "EEE"],
+    0x80d6 => ["prefix", "op_pickup_obj", "S", "E"],
+    0x80d7 => ["prefix", "op_drop_obj", "S", "E"],
+    0x80d8 => ["prefix", "op_add_obj_to_inven", "S", "EE"],
+    0x80d9 => ["prefix", "op_rm_obj_from_inven", "S", "EE"],
+    0x80da => ["prefix", "op_wield_obj_critter", "S", "EE"],
+    0x80db => ["prefix", "op_use_obj", "S", "E"],
+    0x80dc => ["prefix", "op_obj_can_see_obj", "E", "EE"],
+    0x80dd => ["prefix", "op_attack", "S", "EEEEEEEE"],
+    0x80de => ["prefix", "op_start_gdialog", "S", "EEEEE"],
+    0x80df => ["prefix", "op_end_dialogue", "S"],
+    0x80e0 => ["prefix", "op_dialogue_reaction", "S", "E"],
+    0x80e1 => ["prefix", "op_metarule3", "E", "EEEE"],
+    0x80e2 => ["prefix", "op_set_map_music", "S", "EE"],
+    0x80e3 => ["prefix", "op_set_obj_visibility", "S", "EE"],
+    0x80e4 => ["prefix", "op_load_map", "S", "EE"],
+    0x80e5 => ["prefix", "op_wm_area_set_pos", "S", "EEE"],
+    0x80e6 => ["prefix", "op_set_exit_grids", "S", "EEEEE"],
+    0x80e7 => ["prefix", "op_anim_busy", "E", "E"],
+    0x80e8 => ["prefix", "op_critter_heal", "X", "EE"],
+    0x80e9 => ["prefix", "op_set_light_level", "S", "E"],
+    0x80ea => ["prefix", "op_game_time", "E"],
+    0x80eb => ["prefix", "op_game_time_in_seconds", "E"],
+    0x80ec => ["prefix", "op_elevation", "E", "E"],
+    0x80ed => ["prefix", "op_kill_critter", "S", "EE"],
+    0x80ee => ["prefix", "op_kill_critter_type", "S", "EE"],
+    0x80ef => ["prefix", "op_critter_dmg", "S", "EEE"],
+    0x80f0 => ["prefix", "op_add_timer_event", "S", "EEE"],
+    0x80f1 => ["prefix", "op_rm_timer_event", "S", "E"],
+    0x80f2 => ["prefix", "op_game_ticks", "E", "E"],
+    0x80f3 => ["prefix", "op_has_trait", "E", "EEE"],
+    0x80f4 => ["prefix", "op_destroy_object", "S", "E"],
+    0x80f5 => ["prefix", "op_obj_can_hear_obj", "E", "EE"],
+    0x80f6 => ["prefix", "op_game_time_hour", "E"],
+    0x80f7 => ["prefix", "op_fixed_param", "E"],
+    0x80f8 => ["prefix", "op_tile_is_visible", "E", "E"],
+    0x80f9 => ["prefix", "op_dialogue_system_enter", "S"],
+    0x80fa => ["prefix", "op_action_being_used", "E"],
+    0x80fb => ["prefix", "op_critter_state", "E", "E"],
+    0x80fc => ["prefix", "op_game_time_advance", "S", "E"],
+    0x80fd => ["prefix", "op_radiation_inc", "S", "EE"],
+    0x80fe => ["prefix", "op_radiation_dec", "S", "EE"],
+    0x80ff => ["prefix", "op_critter_attempt_placement", "E", "EEE"],
+    0x8100 => ["prefix", "op_obj_pid", "E", "E"],
+    0x8101 => ["prefix", "op_cur_map_index", "E"],
+    0x8102 => ["prefix", "op_critter_add_trait", "X", "EEEE"],            
+    0x8103 => ["prefix", "op_critter_rm_trait", "E", "EEEE"],
+    0x8104 => ["prefix", "op_proto_data", "E", "EE"],
+    0x8105 => ["prefix", "op_message_str", "E", "EE"],
+    0x8106 => ["prefix", "op_critter_inven_obj", "E", "EE"],
+    0x8107 => ["prefix", "op_obj_set_light_level", "S", "EEE"],
+    0x8108 => ["prefix", "op_world_map", "S"],
+    0x8109 => ["prefix", "op_inven_cmds", "E", "EEE"],
+    0x810a => ["prefix", "op_float_msg", "S", "EEE"],
+    0x810b => ["prefix", "op_metarule", "E", "EE"],
+    0x810c => ["prefix", "op_anim", "S", "EEE"],
+    0x810d => ["prefix", "op_obj_carrying_pid_obj", "E", "EE"],
+    0x810e => ["prefix", "op_reg_anim_func", "S", "EE"],
+    0x810f => ["prefix", "op_reg_anim_animate", "S", "EEE"],
+    0x8110 => ["prefix", "op_reg_anim_animate_reverse", "S", "EEE"],
+    0x8111 => ["prefix", "op_reg_anim_obj_move_to_obj", "S", "EEE"],
+    0x8112 => ["prefix", "op_reg_anim_obj_run_to_obj", "S", "EEE"],
+    0x8113 => ["prefix", "op_reg_anim_obj_move_to_tile", "S", "EEE"],
+    0x8114 => ["prefix", "op_reg_anim_obj_run_to_tile", "S", "EEE"],
+    0x8115 => ["prefix", "op_play_gmovie", "S", "E"],
+    0x8116 => ["prefix", "op_add_mult_objs_to_inven", "S", "EEE"],
+    0x8117 => ["prefix", "op_rm_mult_objs_from_inven", "E", "EEE"],
+    0x8118 => ["prefix", "op_get_month", "E"],
+    0x8119 => ["prefix", "op_get_day", "E"],
+    0x811a => ["prefix", "op_explosion", "S", "EEE"],
+    0x811b => ["prefix", "op_days_since_visited", "E"],
+    0x811c => ["prefix", "op_gsay_start", "S"],
+    0x811d => ["prefix", "op_gsay_end", "S"],
+    0x811e => ["prefix", "op_gsay_reply", "S", "EE"],
+    0x811f => ["prefix", "op_gsay_option", "S", "EEEE"],
+    0x8120 => ["prefix", "op_gsay_message", "S", "EEE"],
+    0x8121 => ["prefix", "op_giq_option", "S", "EEEPE"],
+    0x8122 => ["prefix", "op_poison", "S", "EE"],
+    0x8123 => ["prefix", "op_get_poison", "E", "E"],
+    0x8124 => ["prefix", "op_party_add", "S", "E"],
+    0x8125 => ["prefix", "op_party_remove", "S", "E"],
+    0x8126 => ["prefix", "op_reg_anim_animate_forever", "S", "EE"],
+    0x8127 => ["prefix", "op_critter_injure", "S", "EE"],
+    0x8128 => ["prefix", "op_combat_is_initialized", "E"],
+    0x8129 => ["prefix", "op_gdialog_mod_barter", "S", "E"],
+    0x812a => ["prefix", "op_difficulty_level", "E"],
+    0x812b => ["prefix", "op_running_burning_guy", "E"],
+    0x812c => ["prefix", "op_inven_unwield", "S"],
+    0x812d => ["prefix", "op_obj_is_locked", "E", "E"],
+    0x812e => ["prefix", "op_obj_lock", "S", "E"],
+    0x812f => ["prefix", "op_obj_unlock", "S", "E"],
+    0x8130 => ["prefix", "op_obj_is_open", "E", "E"],
+    0x8131 => ["prefix", "op_obj_open", "S", "E"],
+    0x8132 => ["prefix", "op_obj_close", "S", "E"],
+    0x8133 => ["prefix", "op_game_ui_disable", "S"],
+    0x8134 => ["prefix", "op_game_ui_enable", "S"],
+    0x8135 => ["prefix", "op_game_ui_is_disabled", "E"],
+    0x8136 => ["prefix", "op_gfade_out", "S", "E"],
+    0x8137 => ["prefix", "op_gfade_in", "S", "E"],
+    0x8138 => ["prefix", "op_item_caps_total", "E", "E"],
+    0x8139 => ["prefix", "op_item_caps_adjust", "E", "EE"],
+    0x813a => ["prefix", "op_anim_action_frame", "E", "EE"],
+    0x813b => ["prefix", "op_reg_anim_play_sfx", "S", "EEE"],
+    0x813c => ["prefix", "op_critter_mod_skill", "S", "EEE"],
+    0x813d => ["prefix", "op_sfx_build_char_name", "E", "EEE"],
+    0x813e => ["prefix", "op_sfx_build_ambient_name", "E", "E"],
+    0x813f => ["prefix", "op_sfx_build_interface_name", "E", "E"],
+    0x8140 => ["prefix", "op_sfx_build_item_name", "E", "E"],
+    0x8141 => ["prefix", "op_sfx_build_weapon_name", "E", "EEEE"],
+    0x8142 => ["prefix", "op_sfx_build_scenery_name", "E", "EEE"],
+    0x8143 => ["prefix", "op_attack_setup", "S", "EE"],
+    0x8144 => ["prefix", "op_destroy_mult_objs", "E", "EE"],
+    0x8145 => ["prefix", "op_use_obj_on_obj", "S", "EE"],
+    0x8146 => ["prefix", "op_endgame_slideshow", "S"],
+    0x8147 => ["prefix", "op_move_obj_inven_to_obj", "S", "EE"],
+    0x8148 => ["prefix", "op_endgame_movie", "S"],
+    0x8149 => ["prefix", "op_obj_art_fid", "E", "E"],
+    0x814a => ["prefix", "op_art_anim", "E", "E"],
+    0x814b => ["prefix", "op_party_member_obj", "E", "E"],
+    0x814c => ["prefix", "op_rotation_to_tile", "E", "EE"],
+    0x814d => ["prefix", "op_jam_lock", "S", "E"],
+    0x814e => ["prefix", "op_gdialog_set_barter_mod", "S", "E"],
+    0x814f => ["prefix", "op_combat_difficulty", "E"],
+    0x8150 => ["prefix", "op_obj_on_screen", "E", "E"],
+    0x8151 => ["prefix", "op_critter_is_fleeing", "E", "E"],
+    0x8152 => ["prefix", "op_critter_set_flee_state", "S", "EE"],
+    0x8153 => ["prefix", "op_terminate_combat", "S"],
+    0x8154 => ["prefix", "op_debug_msg", "S", "E"],
+    0x8155 => ["prefix", "op_critter_stop_attacking", "S", "E"],
+
+
+
+    ### sfall added 
+    0x8156 => ["prefix", "op_read_byte", "E", "E"],
+    0x8157 => ["prefix", "op_read_short", "E", "E"],
+    0x8158 => ["prefix", "op_read_int", "E", "E"],
+    0x8159 => ["prefix", "op_read_string", "E", "E"],
+    0x81cf => ["prefix", "op_write_byte","S", "EE"],
+    0x81d0 => ["prefix", "op_write_short","S", "EE"],
+    0x81d1 => ["prefix", "op_write_int","S", "EE"],
+    0x821b => ["prefix", "op_write_string","S", "EE"],
+    0x81d2 => ["prefix", "op_call_offset_v0","S", "E"],
+    0x81d3 => ["prefix", "op_call_offset_v1","S", "EE"],
+    0x81d4 => ["prefix", "op_call_offset_v2","S", "EEE"],
+    0x81d5 => ["prefix", "op_call_offset_v3","S", "EEEE"],
+    0x81d6 => ["prefix", "op_call_offset_v4","S", "EEEEE"],
+    0x81d7 => ["prefix", "op_call_offset_r0","E", "E"],
+    0x81d8 => ["prefix", "op_call_offset_r1","E", "EE"],
+    0x81d9 => ["prefix", "op_call_offset_r2","E", "EEE"],
+    0x81da => ["prefix", "op_call_offset_r3","E", "EEEE"],
+    0x81db => ["prefix", "op_call_offset_r4","E", "EEEEE"],
+    0x815a => ["prefix", "op_set_pc_base_stat","S", "EE"],
+    0x815b => ["prefix", "op_set_pc_extra_stat","S", "EE"],
+    0x815c => ["prefix", "op_get_pc_base_stat", "E", "E"],
+    0x815d => ["prefix", "op_get_pc_extra_stat", "E", "E"],
+    0x815e => ["prefix", "op_set_critter_base_stat","S", "EEE"],
+    0x815f => ["prefix", "op_set_critter_extra_stat","S", "EEE"],
+    0x8160 => ["prefix", "op_get_critter_base_stat","E", "EE"],
+    0x8161 => ["prefix", "op_get_critter_extra_stat","E", "EE"],
+    0x81b4 => ["prefix", "op_set_stat_max","S", "EE"],
+    0x81b5 => ["prefix", "op_set_stat_min","S", "EE"],
+    0x81b7 => ["prefix", "op_set_pc_stat_max","S", "EE"],
+    0x81b8 => ["prefix", "op_set_pc_stat_min","S", "EE"],
+    0x81b9 => ["prefix", "op_set_npc_stat_max","S", "EE"],
+    0x81ba => ["prefix", "op_set_npc_stat_min","S", "EE"],
+    0x816b => ["prefix", "op_input_funcs_available", "E"],
+    0x816c => ["prefix", "op_key_pressed","E","E"],
+    0x8162 => ["prefix", "op_tap_key","S", "E"],
+    0x821c => ["prefix", "op_get_mouse_x", "E"],
+    0x821d => ["prefix", "op_get_mouse_y", "E"],
+    0x821e => ["prefix", "op_get_mouse_buttons", "E"],
+    0x821f => ["prefix", "op_get_window_under_mouse", "E"],
+    0x8163 => ["prefix", "op_get_year", "E"],
+    0x8164 => ["prefix", "op_game_loaded", "E"],
+    0x8165 => ["prefix", "op_graphics_funcs_available", "E"],
+    0x8166 => ["prefix", "op_load_shader","E","E"],
+    0x8167 => ["prefix", "op_free_shader","S","E"],
+    0x8168 => ["prefix", "op_activate_shader","S","E"],
+    0x8169 => ["prefix", "op_deactivate_shader","S","E"],
+    0x816d => ["prefix", "op_set_shader_int","S", "EEE"],
+    0x816e => ["prefix", "op_set_shader_float","S", "EEE"],
+    0x816f => ["prefix", "op_set_shader_vector","S", "EEEEEE"],
+    0x81ad => ["prefix", "op_get_shader_version", "E"],
+    0x81ae => ["prefix", "op_set_shader_mode","S", "EE"],
+    0x81b0 => ["prefix", "op_force_graphics_refresh","S", "E"],
+    0x81b1 => ["prefix", "op_get_shader_texture","E", "EE"],
+    0x81b2 => ["prefix", "op_set_shader_texture","S", "EEE"],
+    0x816a => ["prefix", "op_set_global_script_repeat","S","E"],
+    0x819b => ["prefix", "op_set_global_script_type","S","E"],
+    0x819c => ["prefix", "op_available_global_script_types", "E"],
+    0x8170 => ["prefix", "op_in_world_map", "E"],
+    0x8171 => ["prefix", "op_force_encounter","S","E"],
+    0x8229 => ["prefix", "op_force_encounter_with_flags","S", "EE"],
+    0x822a => ["prefix", "op_set_map_time_multi","S", "E"],
+    0x8172 => ["prefix", "op_set_world_map_pos","S", "EE"],
+    0x8173 => ["prefix", "op_get_world_map_x_pos", "E"],
+    0x8174 => ["prefix", "op_get_world_map_y_pos", "E"],
+    0x8175 => ["prefix", "op_set_dm_model","S","E"],
+    0x8176 => ["prefix", "op_set_df_model","S","E"],
+    0x8177 => ["prefix", "op_set_movie_path","S","EE"],
+    0x8178 => ["prefix", "op_set_perk_image","S","EE"],
+    0x8179 => ["prefix", "op_set_perk_ranks","S","EE"],
+    0x817a => ["prefix", "op_set_perk_level","S","EE"],
+    0x817b => ["prefix", "op_set_perk_stat","S","EE"],
+    0x817c => ["prefix", "op_set_perk_stat_mag","S","EE"],
+    0x817d => ["prefix", "op_set_perk_skill1","S","EE"],
+    0x817e => ["prefix", "op_set_perk_skill1_mag","S","EE"],
+    0x817f => ["prefix", "op_set_perk_type","S","EE"],
+    0x8180 => ["prefix", "op_set_perk_skill2","S","EE"],
+    0x8181 => ["prefix", "op_set_perk_skill2_mag","S","EE"],
+    0x8182 => ["prefix", "op_set_perk_str","S","EE"],
+    0x8183 => ["prefix", "op_set_perk_per","S","EE"],
+    0x8184 => ["prefix", "op_set_perk_end","S","EE"],
+    0x8185 => ["prefix", "op_set_perk_chr","S","EE"],
+    0x8186 => ["prefix", "op_set_perk_int","S","EE"],
+    0x8187 => ["prefix", "op_set_perk_agl","S","EE"],
+    0x8188 => ["prefix", "op_set_perk_lck","S","EE"],
+    0x8189 => ["prefix", "op_set_perk_name","S","EE"],
+    0x818a => ["prefix", "op_set_perk_desc","S","EE"],
+    0x818b => ["prefix", "op_set_pipboy_available","S", "E"],
+    0x818c => ["prefix", "op_get_kill_counter","E","E"],
+    0x818d => ["prefix", "op_mod_kill_counter","S", "EE"],
+    0x818e => ["prefix", "op_get_perk_owed", "E"],
+    0x818f => ["prefix", "op_set_perk_owed", "S","E"],
+    0x8190 => ["prefix", "op_get_perk_available","E","E"],
+    0x8191 => ["prefix", "op_get_critter_current_ap","E","E"],
+    0x8192 => ["prefix", "op_set_critter_current_ap","S", "EE"],
+    0x8193 => ["prefix", "op_active_hand", "E"],
+    0x8194 => ["prefix", "op_toggle_active_hand", "S"],
+    0x8195 => ["prefix", "op_set_weapon_knockback","S", "EEE"],
+    0x8196 => ["prefix", "op_set_target_knockback","S", "EEE"],
+    0x8197 => ["prefix", "op_set_attacker_knockback","S", "EEE"],
+    0x8198 => ["prefix", "op_remove_weapon_knockback","S","E"],
+    0x8199 => ["prefix", "op_remove_target_knockback","S","E"],
+    0x819a => ["prefix", "op_remove_attacker_knockback","S","E"],
+    0x819d => ["prefix", "op_set_sfall_global","S", "EE"],
+    0x819e => ["prefix", "op_get_sfall_global_int","E","E"],
+    0x819f => ["prefix", "op_get_sfall_global_float","E","E"],
+    0x822d => ["prefix", "op_create_array","E", "EE"],
+    0x822e => ["prefix", "op_set_array","S", "EEE"],
+    0x822f => ["prefix", "op_get_array","E", "EE"],
+    0x8230 => ["prefix", "op_free_array","S","E"],
+    0x81a0 => ["prefix", "op_set_pickpocket_max","S","E"],
+    0x81a1 => ["prefix", "op_set_hit_chance_max","S","E"],
+    0x81a2 => ["prefix", "op_set_skill_max","S","E"],
+    0x81aa => ["prefix", "op_set_xp_mod","S","E"],
+    0x81ab => ["prefix", "op_set_perk_level_mod","S","E"],
+    0x81c5 => ["prefix", "op_set_critter_hit_chance_mod","S", "EEE"],
+    0x81c6 => ["prefix", "op_set_base_hit_chance_mod","S", "EE"],
+    0x81c7 => ["prefix", "op_set_critter_skill_mod","S", "EE"],
+    0x81c8 => ["prefix", "op_set_base_skill_mod","S", "E"],
+    0x81c9 => ["prefix", "op_set_critter_pickpocket_mod","S", "EEE"],
+    0x81ca => ["prefix", "op_set_base_pickpocket_mod","S", "EE"],
+    0x81a3 => ["prefix", "op_eax_available", "E"],
+    0x81a4 => ["prefix", "op_set_eax_environment","S","E"],
+    0x81a5 => ["prefix", "op_inc_npc_level","S","E"],
+    0x81a6 => ["prefix", "op_get_viewport_x", "E"],
+    0x81a7 => ["prefix", "op_get_viewport_y", "E"],
+    0x81a8 => ["prefix", "op_set_viewport_x","S","E"],   
+    0x81a9 => ["prefix", "op_set_viewport_y","S","E"],   
+    0x81ac => ["prefix", "op_get_ini_setting","E","E"],
+    0x81eb => ["prefix", "op_get_ini_string","E","E"],
+    0x81af => ["prefix", "op_get_game_mode", "E"],
+    0x81b3 => ["prefix", "op_get_uptime", "E"],
+    0x81b6 => ["prefix", "op_set_car_current_town","S","E"],
+    0x81bb => ["prefix", "op_set_fake_perk","S", "EEEE"],
+    0x81bc => ["prefix", "op_set_fake_trait","S", "EEEE"],
+    0x81bd => ["prefix", "op_set_selectable_perk","S", "EEEE"],
+    0x81be => ["prefix", "op_set_perkbox_title","S","E"],
+    0x81bf => ["prefix", "op_hide_real_perks", "S"],
+    0x81c0 => ["prefix", "op_show_real_perks", "S"],
+    0x81c1 => ["prefix", "op_has_fake_perk","E","E"],
+    0x81c2 => ["prefix", "op_has_fake_trait","E","E"],
+    0x81c3 => ["prefix", "op_perk_add_mode","S","E"],
+    0x81c4 => ["prefix", "op_clear_selectable_perks", "S"],
+    0x8225 => ["prefix", "op_remove_trait","S","E"],
+    0x81cb => ["prefix", "op_set_pyromaniac_mod", "S","E"],   
+    0x81cc => ["prefix", "op_apply_heaveho_fix", "S"],
+    0x81cd => ["prefix", "op_set_swiftlearner_mod", "S","E"],
+    0x81ce => ["prefix", "op_set_hp_per_level_mod", "S","E"],   
+    0x81dc => ["prefix", "op_show_iface_tag", "S","E"],
+    0x81dd => ["prefix", "op_hide_iface_tag", "S","E"],
+    0x81de => ["prefix", "op_is_iface_tag_active","E","E"],
+    0x81df => ["prefix", "op_get_bodypart_hit_modifier","E","E"],
+    0x81e0 => ["prefix", "op_set_bodypart_hit_modifier","S", "EE"],
+    0x81e1 => ["prefix", "op_set_critical_table","S", "EEEEE"],
+    0x81e2 => ["prefix", "op_get_critical_table","E", "EEEE"],
+    0x81e3 => ["prefix", "op_reset_critical_table","S", "EEEE"],
+    0x81e4 => ["prefix", "op_get_sfall_arg", "E"],
+    0x81e5 => ["prefix", "op_set_sfall_return","S","E"],
+    0x81ea => ["prefix", "op_init_hook", "E"],
+    0x81e6 => ["prefix", "op_set_unspent_ap_bonus", "S","E"],
+    0x81e7 => ["prefix", "op_get_unspent_ap_bonus", "E"],
+    0x81e8 => ["prefix", "op_set_unspent_ap_perk_bonus", "S","E"],
+    0x81e9 => ["prefix", "op_get_unspent_ap_perk_bonus", "E"],
+    0x81ec => ["prefix", "op_sqrt", "E","E"],
+    0x81ed => ["prefix", "op_abs", "E","E"],
+    0x81ee => ["prefix", "op_sin", "E","E"],
+    0x81ef => ["prefix", "op_cos", "E","E"],
+    0x81f0 => ["prefix", "op_tan", "E","E"],
+    0x81f1 => ["prefix", "op_arctan","E", "EE"],
+    0x81f2 => ["prefix", "op_set_palette", "S","E"],
+    0x81f3 => ["prefix", "op_remove_script", "S","E"],
+    0x81f4 => ["prefix", "op_set_script","S", "EE"],
+    0x81f5 => ["prefix", "op_get_script", "E","E"],
+    0x81f6 => ["prefix", "op_nb_create_char", "E"],
+    0x81f7 => ["prefix", "op_fs_create","E", "EE"],
+    0x81f8 => ["prefix", "op_fs_copy","E", "EE"],
+    0x81f9 => ["prefix", "op_fs_find", "E","E"],
+    0x81fa => ["prefix", "op_fs_write_byte","S", "EE"],
+    0x81fb => ["prefix", "op_fs_write_short","S", "EE"],
+    0x81fc => ["prefix", "op_fs_write_int","S", "EE"],
+    0x81fd => ["prefix", "op_fs_write_float","S", "EE"],
+    0x81fe => ["prefix", "op_fs_write_string","S", "EE"],
+    0x8208 => ["prefix", "op_fs_write_bstring","S", "EE"],
+    0x8209 => ["prefix", "op_fs_read_byte","E","E"],
+    0x820a => ["prefix", "op_fs_read_short","E","E"],
+    0x820b => ["prefix", "op_fs_read_int","E","E"],
+    0x820c => ["prefix", "op_fs_read_float","E","E"],
+    0x81ff => ["prefix", "op_fs_delete","S","E"],
+    0x8200 => ["prefix", "op_fs_size","E","E"],
+    0x8201 => ["prefix", "op_fs_pos","E","E"],
+    0x8202 => ["prefix", "op_fs_seek","S", "EE"],
+    0x8203 => ["prefix", "op_fs_resize","S", "EE"],
+    0x8204 => ["prefix", "op_get_proto_data","E", "EE"],
+    0x8205 => ["prefix", "op_set_proto_data","S", "EEE"],
+    0x8206 => ["prefix", "op_set_self","S","E"],
+    0x8207 => ["prefix", "op_register_hook","S","E"],
+    0x820d => ["prefix", "op_list_begin","E","E"],
+    0x820e => ["prefix", "op_list_next","E","E"],
+    0x820f => ["prefix", "op_list_end","S","E"],
+    0x8210 => ["prefix", "op_sfall_ver_major", "E"],
+    0x8211 => ["prefix", "op_sfall_ver_minor", "E"],
+    0x8212 => ["prefix", "op_sfall_ver_build", "E"],
+    0x8213 => ["prefix", "op_hero_select_win","S","E"],
+    0x8214 => ["prefix", "op_set_hero_race","S","E"],
+    0x8215 => ["prefix", "op_set_hero_style","S","E"],
+    0x8216 => ["prefix", "op_set_critter_burst_disable","S", "EE"],
+    0x8217 => ["prefix", "op_get_weapon_ammo_pid","E","E"],
+    0x8218 => ["prefix", "op_set_weapon_ammo_pid","S", "EE"],
+    0x8219 => ["prefix", "op_get_weapon_ammo_count","E","E"],
+    0x821a => ["prefix", "op_set_weapon_ammo_count","S", "EE"],
+    0x8220 => ["prefix", "op_get_screen_width", "E"],
+    0x8221 => ["prefix", "op_get_screen_height", "E"],
+    0x8222 => ["prefix", "op_stop_game", "S"],
+    0x8223 => ["prefix", "op_resume_game", "S"],
+    0x8224 => ["prefix", "op_create_message_window","S","E"],
+    0x8226 => ["prefix", "op_get_light_level", "E"],
+    0x8227 => ["prefix", "op_refresh_pc_art", "S"],
+    0x8228 => ["prefix", "op_get_attack_type", "E"],
+    0x822b => ["prefix", "op_play_sfall_sound","E", "EE"],
+    0x822c => ["prefix", "op_stop_sfall_sound","S", "E"],
+    0x8236 => ["prefix", "op_list_as_array","E", "E"],
+    0x8235 => ["prefix", "op_string_split","E", "EE"],
+    0x8231 => ["prefix", "op_len_array","E", "E"],
+    0x8232 => ["prefix", "op_resize_array","S", "EE"],
+    0x8233 => ["prefix", "op_temp_array","E", "EE"],
+    0x8234 => ["prefix", "op_fix_array","S", "E"],
+    0x8237 => ["prefix", "op_atoi","E", "E"],
+    0x8238 => ["prefix", "op_atof","E", "E"],
+    0x8239 => ["prefix", "op_scan_array","E", "EE"],
+    0x823a => ["prefix", "op_get_tile_fid","E", "E"],
+    0x823b => ["prefix", "op_modified_ini", "E"],
+    0x823c => ["prefix", "op_get_sfall_args", "E"],
+    0x823d => ["prefix", "op_set_sfall_arg","S", "EE"],
+    0x823e => ["prefix", "op_force_aimed_shots","S", "E"],
+    0x823f => ["prefix", "op_disable_aimed_shots","S", "E"],
+    0x8240 => ["prefix", "op_mark_movie_played","S", "E"],
+    0x8241 => ["prefix", "op_get_npc_level","E", "E"],
+  }
+end
+#####
+# A simple class that allows a string to be used as a stream.
+#
+class StringIO
+  def initialize(str)
+    @pos = 0
+    @data = str
+  end
+  def eof
+    (@pos >= @data.length)
+  end
+  def read(count = nil)
+    count = (@data.length - @pos) if count.nil?
+    raise EOFError if (count + @pos) > @data.length
+    v = @data.unpack("@#{@pos}a#{count}").at(0)
+    @pos += count
+    v
+  end
+
+  def read_float
+    raise EOFError if (4 + @pos) > @data.length
+    v = @data.unpack("@#{@pos}g").at(0)
+    @pos += 4
+    v
+  end
+  def read_uint32
+    raise EOFError if (4 + @pos) > @data.length
+# SLOW    v = @data.unpack("@#{@pos}N").at(0)
+    v = (@data[@pos] << 24) + (@data[@pos + 1] << 16) +
+        (@data[@pos + 2] << 8) + (@data[@pos + 3])
+    @pos += 4
+    v
+  end
+  def read_uint16
+    raise EOFError if (2 + @pos) > @data.length
+# SLOW    v = @data.unpack("@#{@pos}n").at(0)
+    v = (@data[@pos] << 8) + @data[@pos + 1]
+    @pos += 2
+    v
+  end
+
+  def seek(val, whence)
+    if whence == IO::SEEK_SET
+      @pos = val
+    elsif whence == IO::SEEK_CUR
+      @pos += val
+    elsif whence == IO::SEEK_END
+      @pos = @data.length + val
+    else
+      raise IOError, "invalid value for whence #{whence}"
+    end
+  end
+
+  attr_reader :pos
+  alias :eof? :eof
+end
+
+#####
+# A Symbol table contains a list of symbols (strings) and the offsets that
+# they occur at.
+#
+class SymTable
+  def initialize
+    @symbols = {}            # hash of offset to symbol name
+    @list = []               # list of all symbols in order of addition
+    @used = []               # flag for whether the sybol is used or not
+    @offset = 4              # number of bytes required to store table
+                             # +4 is for initial int specifying the size
+  end
+
+  # Reads a symbol table from the given integer stream.
+  def read(io)
+    size = io.read_uint32()
+    start_offset = io.pos
+    if size != 0xffffffff
+      while io.pos < (start_offset + size)
+        len = io.read_uint16()
+        len += 1 unless (len % 2).zero?
+
+        sym = io.read(len).gsub(/\0*$/, '')
+        add(sym)
+      end
+      term = io.read_uint32()
+      raise "symtab not terminated" if term != 0xffffffff
+    end
+  end
+
+  # Size of the symbol table in bytes, when writing to an .int file.
+  def size
+    # +4 on non empty tables is for the terminating int.
+    @list.length == 0 ? @offset : @offset + 4
+  end
+
+  # Adds the given entry to the symbol table if it isn't already added.
+  def add(sym)
+    unless @list.include?(sym)
+      @list.push(sym)                  # remember order of addition
+      @used.push(false)                # assume not used
+
+      @offset += 2                     # +2 for length field
+
+      # store mapping
+      @symbols[@offset] = sym
+
+      # name needs to be null terminated, plus total length must be even
+      len = (sym.length % 2).zero? ? sym.length + 2 : sym.length + 1
+
+      # increase size by length of string
+      @offset += len
+    end
+  end
+
+  # Returns the symbol stored at the given offset
+  def symbol(offset)
+    @symbols[offset]
+  end
+
+  # Iterate over each entry in the table.
+  def each(&block)
+    @list.each(&block)
+  end
+
+  # Sets a flag to specify that this particular symbol is used.
+  def use(sym)
+    index = @list.index(sym)
+    @used[index] = true            unless index.nil?
+  end
+
+  # Returns a list of all unused symbols (in order of addition).
+  def unused
+    unused = []
+    @list.size.times do |i|
+      sym = @list[i]
+      unused.push(sym) if @used[i] == false
+    end
+
+    unused
+  end
+end
+
+
+#####
+# A container for global data stored in a script file.  Global data includes
+# script variables, exported procedures and exported variables.
+#
+class Globals < NodeContainer
+  def initialize(script, size)
+    super(script, size)
+    @script_vars = Array.new
+    @exported_vars = Hash.new
+    @exported_procs = Hash.new
+    @names_set = false
+  end
+
+  # Returns a list of all defined script variables.
+  def script_vars
+    vars = []
+    @script_vars.each { |el| vars.push(el[0]) }
+    vars
+  end
+
+  # Returns a list of all defined exported variables.
+  def exported_vars
+    @exported_vars.keys
+  end
+
+  # Returns the number of script variables.
+  def num_script_vars
+    @script_vars.size
+  end
+
+  # Returns the name of the script variable at the given index.
+  def script_var_name(idx)
+    name, value = @script_vars[idx]
+    name
+  end
+
+  # Sets names for the script variables.
+  def set_script_var_names(names)
+    raise "size mismatch" if names.size != @script_vars.size
+    names.size.times do |i|
+      @script_vars[i][0] = names[i]
+    end
+    @names_set = true
+  end
+
+  # - Returns definitions for variables of the given types.
+
+  def unknown_var_definition(var)
+    "// [import] variable #{var};"
+  end
+  def imported_var_definition(var)
+    "import variable #{var};"
+  end
+  def exported_var_definition(var)
+    raise "no exported variable #{var}" unless @exported_vars.has_key?(var)
+    "export variable #{var} := #{@exported_vars[var]};"
+  end
+  def script_var_definition(var)
+    list = @script_vars.assoc(var)
+    raise "no script variable #{var}" if list.nil?
+    "variable #{list[0]} := #{list[1]};"
+  end
+
+
+  # Reduces the opcodes into variable and exported procedure definitions.
+  def reduce
+    remove_opcodes_from_head([0x802c])
+    remove_opcodes_from_tail([0xc001, 0x8003, 0xc001, 0x8004])
+
+    reduce_export_var_declarations
+    reduce_export_var_definitions
+    reduce_export_proc_declarations
+
+    # after above reductions, @nodes should just contain values of script vars
+    @nodes.each { |n| raise "malformed script file" unless n.has_value? }
+    log_size = Math.log10(@nodes.size).floor + 1  unless @nodes.size.zero?
+    @nodes.size.times do |i|
+      @script_vars.push [sprintf("SVar%0#{log_size}d", i + 1), @nodes[i].value]
+    end
+    @nodes = nil
+  end
+
+  #-----------------
+  private
+
+  def reduce_export_var_declarations
+    loop_again = true
+    while loop_again
+      loop_again = false
+
+      @nodes.size.times do |i|
+        node = @nodes[i]
+        if node.opcode? and node.opcode == 0x8016
+          loop_again = true
+          raise "malformed script file" if i < 1
+          @exported_vars[@nodes[i - 1].label] = 0
+          @nodes.slice!(i - 1, 2)
+          break
+        end
+      end
+    end
+  end
+
+  def reduce_export_var_definitions
+    loop_again = true
+    while loop_again
+      loop_again = false
+
+      @nodes.size.times do |i|
+        node = @nodes[i]
+        if node.opcode? and node.opcode == 0x8015
+          loop_again = true
+          raise "malformed script file" if i < 2
+          sym = @nodes[i - 1].label
+          val = @nodes[i - 2].value
+          @exported_vars[sym] = val
+          @nodes.slice!(i - 2, 3)
+          break
+        end
+      end
+    end
+  end
+
+  def reduce_export_proc_declarations
+    loop_again = true
+    while loop_again
+      loop_again = false
+
+      @nodes.size.times do |i|
+        node = @nodes[i]
+        if node.opcode? and node.opcode == 0x8017
+          loop_again = true
+          raise "malformed script file" if i < 2
+          proc_name = @nodes[i - 1].procedure_name
+          num_args = @nodes[i - 2].int
+          @exported_procs[proc_name] = num_args
+          @nodes.slice!(i - 2, 3)
+          break
+        end
+      end
+    end
+  end
+end
+
+#####
+# A defined procedure in a script file.
+#
+class Procedure < NodeContainer
+  IMPORT   = 0x04
+  EXPORT   = 0x08
+  CRITICAL = 0x10
+
+  # Sets the string to use for a single level on indentation.
+  def Procedure.indent=(indent)
+    @@indent = indent
+  end
+
+  def initialize(script, name, flags, num_params, addr, size, u1, u2)
+    super(script, size)
+    @name, @flags, @num_params, @addr = name, flags, num_params, addr
+    @u1, @u2 = u1, u2
+    @reducer = nil
+
+    @max_num_local_vars = 0
+    @local_vars = Array.new
+    @external_vars = Array.new
+  end
+  attr_accessor :nodes, :reducer
+  attr_reader :name, :addr, :num_params, :external_vars
+
+
+  # Marks all external variables.
+  def mark_external_vars
+    # find all external variables and marks them as used.
+    prev = nil
+    @nodes.each do |node|
+      if node.opcode? and (node.opcode == 0x8014 or node.opcode == 0x8015)
+        var = prev.label
+        @external_vars.push(var) unless @external_vars.include?(var)
+      end
+      prev = node
+    end
+  end
+
+  # Returns whether this procedure is defined as critical or not.
+  def critical?
+    (@flags & CRITICAL).nonzero?
+  end
+
+  # Returns the number of local variables.
+  def num_local_vars
+    @local_vars.size
+  end
+
+  # Returns the name of the local variable (including procedure arguments)
+  # for the given index.
+  def local_var_name(idx)
+
+      num_vars = @num_params + @local_vars.size 
+      if idx < @num_params
+        if (idx <= 9) and (@num_params <= 9)
+          log_size = Math.log10(@num_params).floor + 1
+          sprintf("arg0%0#{log_size}d", idx + 1)
+        else
+          log_size = Math.log10(@num_params).floor + 1
+          sprintf("arg%0#{log_size}d", idx + 1)
+        end
+      else
+        log_size = Math.log10(@max_num_local_vars).floor + 1
+        sprintf("LVar%0#{log_size}d", idx + 1 - @num_params)
+      end
+  end
+
+  # Returns the procedure declaration.
+  def declaration
+    header = ((@flags & IMPORT)   != 0) ? "import "   :
+             ((@flags & EXPORT)   != 0) ? "export "   :
+             ((@flags & CRITICAL) != 0) ? "critical " : ""
+
+    params = ""
+    if (@num_params > 0)
+      params = "(variable arg01"
+      2.upto(@num_params) do |i|
+        if (i <= 9)
+          params += ", variable arg0#{i}"
+        end
+        if (i > 9)
+          params += ", variable arg#{i}" 
+        end
+      end
+      params += ")"
+    end
+
+    "#{header}procedure #{@name}#{params};"
+  end
+
+  # Returns the procedure definition.
+  def definition
+    header = critical? ? "critical " : ""
+
+    params = ""
+    if (@num_params > 0)
+      params = "(variable arg01"
+      2.upto(@num_params) do |i|
+        if (i <= 9)
+          params += ", variable arg0#{i}"
+        end
+        if (i > 9)
+          params += ", variable arg#{i}" 
+        end
+      end
+      params += ")"
+    end
+
+    strings = Array.new
+    strings.push "#{header}procedure #{@name}#{params}"
+    strings.push "begin"
+    @local_vars.each_with_index do |val, i|
+      strings.push(@@indent +
+                   "variable #{local_var_name(i + @num_params)} := #{val};")
+    end
+    strings.push("") if @local_vars.size.nonzero?
+    @nodes.each { |n| strings.push(n.node_str(@@indent, 1)) }
+    strings.push "end"
+
+    strings.join("\n")
+  end
+
+  # Reduces the list of opcode nodes into a procedure body.
+  def reduce
+    return if @size.zero?
+
+    # remove header and tail from procedure nodes
+    remove_opcodes_from_head([0x802b])
+    if critical?
+      remove_opcodes_from_tail([0x802a, 0x8029, 0x8003, 0x801c])
+    else
+      remove_opcodes_from_tail([0x802a, 0x8029, 0x801c])
+    end
+
+    # count num local variables
+    num_lvars = 0
+    while @nodes.last.opcode == 0x8031
+      num_lvars += 1
+      @nodes.slice!(-3, 3)
+    end
+    num_lvars -= @num_params
+
+    if critical?
+      remove_opcodes_from_tail([0xc001, 0x800d, 0x8019, 0x802a, 0x8029,
+                                0x800c, 0x8003, 0x801c])
+    else
+      remove_opcodes_from_tail([0xc001, 0x800d, 0x8019, 0x802a, 0x8029,
+                                0x800c,  0x801c])
+    end
+
+    if num_lvars > 0
+      @max_num_local_vars = num_lvars
+    else
+      # num_lvars not determined, so take a guess
+      @max_num_local_vars = 0
+      @nodes.each_with_index do |n, i|
+        if ! n.has_value?
+          @max_num_local_vars = i
+          break
+        end
+      end
+    end
+
+    # reduce all opcodes to statements
+    @reducer.reduce(self, @nodes)
+
+    # opcodes at head of nodes list before statements are local variable
+    # values
+    @nodes.each_with_index do |n, i|
+      if n.opcode? and n.has_value? and i < @max_num_local_vars
+        @local_vars.push(n.value)
+      else
+        break
+      end
+    end
+    @nodes.slice!(0, @local_vars.size)
+  end
+end
+
+
+
+#####
+# A class to decompile a compiled ssl script.
+#
+class CompiledScript
+
+  # Decompile the script stored as a string using the rules for specific
+  # fallout version.
+  def initialize(str, version)
+    @globals = nil
+    @labels = nil
+    @strings = nil
+    @procedures = Array.new
+
+    # read data and store in @globals / @procedures
+    read(StringIO.new(str))
+
+    # reduce all script variables
+    @globals.reduce
+
+    # mark external vars used by the procedure.
+    # it is necessary to do this now so that the labels for the external
+    # variables are marked as 'used'.
+    @procedures.each { |pr| pr.mark_external_vars }
+
+    # if the number of unused labels is the same as the number of script
+    # variables, then there is a 1:1 correspondence between the two
+    unused_labels = @labels.unused
+    if unused_labels.size == @globals.num_script_vars
+      @globals.set_script_var_names(unused_labels)
+      unused_labels.each { |l| @labels.use(l) }
+    end
+
+    # reduce all procedures
+    reducer = StatementReducer.new(version)
+    @procedures.each { |pr| pr.reducer = reducer ; pr.reduce }
+  end
+
+
+  # Returns a given entry from the label symbol table
+  def label(idx)
+    str = @labels.symbol(idx)
+    @labels.use(str) unless str.nil?
+    str
+  end
+
+  # Returns a given entry from the string symbol table
+  def string(idx)
+    str = @strings.symbol(idx)
+    unless str.nil?
+      @strings.use(str)
+      return str.inspect
+    end
+    nil
+  end
+
+  # Returns the given procedure name
+  def procedure_name(idx)
+    if (idx >= 1 and idx <= @procedures.size)
+      # need to -1 as procedures start from 1, not 0
+      @procedures[idx - 1].name
+    else
+      nil
+    end
+  end
+
+  # Returns the name of the given script variable
+  def script_var_name(idx)
+    @globals.script_var_name(idx)
+  end
+
+
+  # Writes the decompiled script to the given io stream.
+  def write(io)
+
+    # determine which variable are imported, exported or script
+    externals = []
+    @procedures.each { |p| externals += p.external_vars }
+    externals = externals.sort.uniq
+
+    exported_vars = @globals.exported_vars
+    imported_vars = externals - exported_vars
+    script_vars = @globals.script_vars
+    procedure_names = []
+    @procedures.each { |p| procedure_names.push(p.name) }
+
+    # handle the case where names for script variables couldn't be determined
+    unused_labels = @labels.unused
+    if (unused_labels.size != 0)
+      diff = unused_labels.size - @globals.num_script_vars
+
+      if @globals.num_script_vars.nonzero?
+        io.puts "// #{@globals.num_script_vars} script variable" +
+                (@globals.num_script_vars.nonzero? ? "s" : "") +
+                " and " +
+                "#{diff} unreferenced imported variable" +
+                (diff.nonzero? ? "s" : "")
+        io.puts("//")
+        unused_labels.each { |sym| io.puts("// #{sym}") }
+        io.puts
+        @globals.script_vars.each do |v|
+          io.puts(@globals.script_var_definition(v))
+        end
+        io.puts
+      else
+        # no script variables, so unused must be imported
+        imported_vars += unused_labels
+      end
+    end
+
+
+    # write all script and external variables, and procedure declarations
+    prev = nil
+    @labels.each do |var|
+      next if var == ".............."
+
+      if imported_vars.include?(var)
+        io.puts unless prev == :imported or prev.nil?
+        io.puts(@globals.imported_var_definition(var))
+        prev = :imported
+      elsif exported_vars.include?(var)
+        io.puts unless prev == :exported or prev.nil?
+        io.puts(@globals.exported_var_definition(var))
+        prev = :exported
+      elsif script_vars.include?(var)
+        io.puts unless prev == :script or prev.nil?
+        io.puts(@globals.script_var_definition(var))
+        prev = :script
+      elsif procedure_names.include?(var)
+        io.puts unless prev == :procedure or prev.nil?
+        @procedures.each { |p| io.puts(p.declaration) if p.name == var }
+        prev = :procedure
+      else
+        io.puts unless prev == :unknown or prev.nil?
+        io.puts(@globals.unknown_var_definition(var))
+        prev = :unknown
+      end
+    end
+
+    io.puts
+
+    # write all procedure definitions
+    @procedures.each do |p|
+      if p.addr != 0
+        p.definition.split("\n").each { |l| io.puts(l) }
+        io.puts
+      end
+    end
+  end
+
+
+  #-----------------
+  private
+
+  # Reads script data from the given io stream
+  def read(io)
+    # compiled script starts with 21 shorts ...
+    header = Array.new
+    21.times do
+      header.push io.read_uint16
+    end
+
+    # remove wildcards from header
+    header.slice!(6, 2)
+
+    # Header should begin with this pattern
+    expected = [0x8002, 0xc001, 0x0000, 0x0012, 0x800d, 0xc001, # 2 wildcards, 
+                0x8004, 0x8010, 0x801a, 0x8020, 0x801a, 0x8021,
+                0x801a, 0x8022, 0x801a, 0x8023, 0x8024, 0x8025, 0x8026]
+
+    raise "Not an INT file." unless header == expected
+
+    # ... followed by a procedure table ...
+    procedures = []
+    count = io.read_uint32()
+    count.times do
+      name_id    = io.read_uint32()
+      flags      = io.read_uint32()
+      u1         = io.read_uint32()
+      u2         = io.read_uint32()
+      addr       = io.read_uint32()
+      num_params = io.read_uint32()
+      size       = 0
+      procedures.push [name_id, flags, num_params, addr, size, u1, u2]
+    end
+
+    # ... then a label symbol table ...
+    @labels = SymTable.new
+    @labels.read(io)
+
+    # ... plus a strings symbol table
+    @strings = SymTable.new
+    @strings.read(io)
+
+
+    # ensure that first procedure listed is known entrypoint
+    p = procedures.shift
+    name = label(p[0])
+    if name != ".............."
+      raise "unexpected procedure at position 0 (#{name})"
+    end
+
+    # ensure that procedures are in sorted order by address
+    addresses = []
+    procedures.each { |p| addresses.push(p[3]) }
+    valid_addresses = addresses.clone
+    valid_addresses.delete(0)
+    if valid_addresses.sort != valid_addresses
+      raise "procedures are not sorted in ascending address order"
+    end
+
+    # find first procedure with non zero address
+    first = -1
+    procedures.size.times do |i|
+      if (procedures[i][3] != 0)
+        first = i
+        break
+      end
+    end
+
+    # calculate the size of each procedure
+    prev_pos = first
+    1.upto(procedures.size - 1) do |i|
+      addr = procedures[i][3]
+      if addr != 0
+        prev_addr = procedures[prev_pos][3]
+        procedures[prev_pos][4] = (addr - prev_addr)
+        prev_pos = i
+      end
+    end
+    procedures[prev_pos][4] = -1  unless procedures.size.zero?
+
+    # calculate size of globals definitions
+    globals_size = (first == -1) ? -1 : (procedures[first][3] - io.pos)
+
+    # read global opcodes
+    @globals = Globals.new(self, globals_size)
+    @globals.experimental_read(io)
+
+    # read opcodes for each procedure
+    procedures.each do |p|
+      name = label(p[0])
+      procedure = Procedure.new(self, name, p[1], p[2], p[3], p[4], p[5], p[6])
+      procedure.experimental_read(io)
+      @procedures.push(procedure)
+    end
+  end
+
+end
+
+#--- main program ----
+if __FILE__ == $0
+  require 'getoptlong'
+
+  # Prints usage message and exits
+  def usage(exit_val = 0)
+    $stderr.puts <<'END_USAGE'
+decompile - Decompiles int files (script format in Fallout1 and Fallout2)
+            to source format.
+Usage: decompile [OPTION]... [FILE]...
+Options:
+
+Script file options:
+  --fallout1                 specify INT file is of type Fallout 1
+  --fallout2                 specify INT file is of type Fallout 2 (default)
+
+Output modifiers:
+  -n x, --indent=x           specify indent in x spaces (default is 2)
+  -t, --tabs                 use tabs instead of spaces for indenting
+
+Operation modifiers:
+  -c, --stdout --to-stdout   write on standard output
+  -i, --interactive          prompt before overwrite
+
+Informative output:
+  -v, --verbose              print more information
+  -h, --help                 display this help and exit
+  -V, --version              output version information and exit
+
+FILE                         file(s) to convert.  may use wildcards.
+END_USAGE
+    exit(exit_val)
+  end
+
+  # Processes command line options, setting appropriate fields
+  def process_options
+    usage() if ARGV.length.zero?
+
+    opts = GetoptLong.new(
+      [ "--fallout1",                    GetoptLong::NO_ARGUMENT ],
+      [ "--fallout2",                    GetoptLong::NO_ARGUMENT ],
+      [ "--indent", "-n",                GetoptLong::REQUIRED_ARGUMENT ],
+      [ "--tabs", "-t",                  GetoptLong::NO_ARGUMENT ],
+      [ "--stdout", "--to-stdout", "-c", GetoptLong::NO_ARGUMENT ],
+      [ "--interactive", "-i",           GetoptLong::NO_ARGUMENT ],
+      [ "--verbose", "-v",               GetoptLong::NO_ARGUMENT ],
+      [ "--help",   "-h",                GetoptLong::NO_ARGUMENT ],
+      [ "--version", "-V",               GetoptLong::NO_ARGUMENT ]
+    )
+
+    opts.quiet = true
+    begin
+      fallout1 = fallout2 = stdout = interactive = verbose = tabs = false
+      indent = nil
+
+      opts.each do |opt, arg|
+        case(opt)
+        when "--fallout1"    ; fallout1    = true
+        when "--fallout2"    ; fallout2    = true
+        when "--tabs"        ; tabs        = true
+        when "--indent"      ; indent      = arg.to_i
+        when "--stdout"      ; stdout      = true
+        when "--interactive" ; interactive = true
+        when "--verbose"     ; verbose     = true
+        when "--help"        ; usage()
+        when "--version"     ; puts "decompile 1.01" ; exit(0)
+        end
+      end
+
+      if fallout1 and fallout2
+        $stderr.puts "can not specify both --fallout1 and --fallout2"
+        usage(1)
+      end
+
+      if tabs and indent
+        $stderr.puts "can not specify both --tabs and --indent"
+        usage(1)
+      end
+
+      if tabs
+        @indent = "\t"
+      end
+
+      if indent
+        @indent = " " * indent
+      end
+
+      @fallout_version = 1 if fallout1
+      @fallout_version = 2 if fallout2
+      @stdout = true       if stdout
+      @interactive = true  if interactive
+      @verbose = true      if verbose
+    rescue
+      $stderr.puts $!
+      usage(1)
+    end
+  end
+
+
+  #
+  # Begin processing
+  #
+
+  @indent = "  "
+  @fallout_version = 2
+  @stdout = false
+  @interactive = false
+  @verbose = false
+  process_options()
+
+  # set default indent for procedures
+  Procedure.indent = @indent
+
+  # get list of files to process, expanding globs
+  files = []
+  ARGV.each { |arg| files.concat Dir::glob(arg) }
+
+  # decompile each file
+  files.each do |name|
+    begin
+      puts "decompiling #{name} " if @verbose
+
+      data = ""
+      File.open(name, "rb") { |io| data = io.read() }
+      script = CompiledScript.new(data, @fallout_version)
+
+      if @stdout
+        script.write($stdout)
+      else
+        if name =~ /int$/
+          out_name = name.sub(/int$/, "ssl")
+        else
+          out_name = name + ".ssl"
+        end
+
+        if @interactive and FileTest.exists?(out_name)
+          print "overwrite `#{out_name}'? "
+          resp = $stdin.readline()
+          next unless resp =~ /^y/i
+        end
+
+        File.open(out_name, "w") { |io| script.write(io) }
+      end
+    rescue
+      $stderr.puts "Error decompiling `#{name}': " + $!
+    end
+  end
+
+  exit(0)
+end
+
