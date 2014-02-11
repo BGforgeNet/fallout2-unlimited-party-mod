@@ -21,6 +21,6 @@ License:
 It provided as is, without any guarantee. Feel free to use it in any way that you see fit.
 
 Used software:
-1) Noid's compiler (from http://www.nirran.com/Fallout2moddingTools.php)
-2) Ruby (http://ruby.org)
-3) Gema (http://gema.sourceforge.net)
+- Noid's compiler (from http://www.nirran.com/Fallout2moddingTools.php)
+- Ruby (http://ruby.org)
+- Gema (http://gema.sourceforge.net)
