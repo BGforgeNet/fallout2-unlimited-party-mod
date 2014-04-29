@@ -8,6 +8,7 @@ This mod removes dialogue charisma checks on party join in Fallout 2.
 ###Special notes:
 - **It will ONLY work if you have killap's patch** or restoration pack (or both) installed. You can get those at http://www.killap.net.
 - It does not remove other checks (karma, etc). Companions may still refuse to join because of that.
+- It should be **compatible with any other mod** provided that "unlimited party" is installed last. It patches files instead of overwriting them.
 - It affects the following companions:
     * Brain bot
     * Cassidy
@@ -25,9 +26,8 @@ This mod removes dialogue charisma checks on party join in Fallout 2.
     * Robodog
     * Sulik
     * Vic
-- It should be **compatible with any other mod** provided that "unlimited party" is installed last. It patches files instead of overwriting them.
-- Start a new game after installation
-- If you have any issues, reach me on github. Attach logs (fallout2-unlimited-party-mod/tools/logs) so I could debug.
+- Start a new game after installation.
+- Tested on Windows XP x86. If you have any issues, reach me on github (burner1024). Attach logs (fallout2-unlimited-party-mod/tools/logs) so I could debug.
 
 ###Installation
 - Download zip archive https://github.com/burner1024/fallout2-unlimited-party-mod/archive/master.zip
@@ -46,6 +46,6 @@ This mod removes dialogue charisma checks on party join in Fallout 2.
 * Gema (http://gema.sourceforge.net)
 
 ###Changelog
-* Version 1: initial release
-* Version 2: fixed installation bug, added support for Restoration pack NPCs, Miria and Davin, updated readme
+* Version 1: initial release.
+* Version 2: fixed installation bug, added support for Restoration pack NPCs, Miria and Davin, updated readme.
 
