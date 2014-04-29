@@ -25,7 +25,7 @@ This mod removes dialogue charisma checks on party join in Fallout 2.
     * Robodog
     * Sulik
     * Vic
-- It should be compatible with *any* other mod provided that unlimited party is installed last. It patches files instead of overwriting them.
+- It should be **compatible with any other mod** provided that "unlimited party" is installed last. It patches files instead of overwriting them.
 - Start a new game after installation
 - If you have any issues, reach me on github. Attach logs (fallout2-unlimited-party-mod/tools/logs) so I could debug.
 
