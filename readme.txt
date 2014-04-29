@@ -1,6 +1,9 @@
 ##Unlimited party mod for Fallout 2
+
 Version 2
+
 This mod removes dialogue charisma checks on party join in Fallout 2.
+
 
 ###Special notes:
 - **It will ONLY work if you have killap's patch** or restoration pack (or both) installed. You can get those at http://www.killap.net.
