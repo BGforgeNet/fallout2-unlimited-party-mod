@@ -13,9 +13,9 @@ set tools_dir=tools
 set backup_dir=%tools_dir%\backup
 set scripts_dir=%game_dir%\data\Scripts
 set tmp_dir=%tools_dir%\tmp
-PATH=%tools_dir%\ruby\usr\local\bin;%tools_dir%\gema;%PATH%
+set PATH=%tools_dir%\ruby\usr\local\bin;%tools_dir%\gema;%PATH%
 
-FOR %%S in (cck9 dcvic ecdogmet gclenny hcmarcus kcsulik nhmyron ocgoris vccasidy scrobo wcbrnbot) DO (
+FOR %%S in (cck9 dcvic ecdogmet epac10 epac11 epac12 gclenny hcmarcus kcsulik mcdavin mcmyria nhmyron ocgoris vccasidy scrobo wcbrnbot) DO (
 	copy /y %scripts_dir%\%%S.int %backup_dir%
 	copy /y %scripts_dir%\%%S.int %tmp_dir%
 	ruby "%tools_dir%/compiler/decompile" %tmp_dir%\%%S.int
