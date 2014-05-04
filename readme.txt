@@ -1,6 +1,6 @@
 ##Unlimited party mod for Fallout 2
 
-Version 3
+Version 4
 
 This mod removes dialogue charisma checks on party join in Fallout 2.
 
@@ -49,6 +49,7 @@ This mod removes dialogue charisma checks on party join in Fallout 2.
 * Gema (http://gema.sourceforge.net)
 
 ###Changelog
+* Version 4: really fix space bug, better code style, graceful handling of missing files, better logging
 * Version 3: fixed installation into a directory with spaces
 * Version 2: fixed installation bug, added support for Restoration pack NPCs, Miria and Davin, updated readme.
 * Version 1: initial release.
