@@ -34,7 +34,7 @@ FOR %%S in (
   scrobo
   wcbrnbot
 ) DO (
-  IF EXIST "%scripts_dir%\%%S.int%" ( 
+  IF EXIST "%scripts_dir%\%%S.int" ( 
     copy /y "%scripts_dir%\%%S.int" "%backup_dir%"
     copy /y "%scripts_dir%\%%S.int" "%tmp_dir%"
     ruby "%tools_dir%/compiler/decompile" "%tmp_dir%\%%S.int"
