@@ -1,6 +1,6 @@
 ##Unlimited party mod for Fallout 2
 
-Version 4
+Version 5
 
 This mod removes dialogue charisma checks on party join in Fallout 2.
 
@@ -27,7 +27,7 @@ This mod removes dialogue charisma checks on party join in Fallout 2.
     * Sulik
     * Vic
 - Start a new game after installation.
-- Tested on Windows XP x86. If you have any issues, reach me on github (burner1024). Attach logs (fallout2-unlimited-party-mod/tools/logs) so I could debug.
+- Tested on Windows XP x86. If you have any issues, reach me on github (burner1024). Attach logs (fallout2-unlimited-party-mod-master/tools/logs) so I could debug.
 
 ###Installation
 - Download zip archive https://github.com/burner1024/fallout2-unlimited-party-mod/archive/master.zip
@@ -49,6 +49,7 @@ This mod removes dialogue charisma checks on party join in Fallout 2.
 * Gema (http://gema.sourceforge.net)
 
 ###Changelog
+* Version 5: fix typo that caused Miria to be not affected
 * Version 4: really fix space bug, better code style, graceful handling of missing files, better logging
 * Version 3: fixed installation into a directory with spaces
 * Version 2: fixed installation bug, added support for Restoration pack NPCs, Miria and Davin, updated readme.

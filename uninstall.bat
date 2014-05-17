@@ -6,7 +6,7 @@ goto :exit
 
 :restore
 @echo on
-echo "version 4"
+echo "version 5"
 pushd ..
 set "game_dir=%CD%"
 popd
