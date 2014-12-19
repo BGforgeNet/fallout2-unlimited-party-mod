@@ -49,7 +49,7 @@ This mod removes dialogue charisma checks on party join in Fallout 2.
 * Gema (http://gema.sourceforge.net)
 
 ###Changelog
-* Version 6: fix bug that prevented characters with CHA less than 2 to recruit companions. Also, be more more verbose during installation and fix some non-critical warnings
+* Version 6: fix bug that prevented characters with CHA less than 2 to recruit companions. Also, be more verbose during installation and fix some non-critical warnings
 * Version 5: fix typo that caused Miria to be not affected
 * Version 4: really fix space bug, better code style, graceful handling of missing files, better logging
 * Version 3: fixed installation into a directory with spaces
