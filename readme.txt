@@ -39,7 +39,7 @@ This mod removes dialogue charisma checks on party join in Fallout 2.
 The mod is tested on Windows XP x86. If you have any issues, reach me on [github](https://github.com/burner1024/fallout2-unlimited-party-mod/issues). Attach logs (fallout2-unlimited-party-mod-X/tools/logs) so I could debug.
 
 ###Installation
-- Download lastest release "Source zip" archive from [releases page](https://github.com/burner1024/fallout2-unlimited-party-mod/releases/latest)
+- Download "Source code (zip)" archive from [latest release page](https://github.com/burner1024/fallout2-unlimited-party-mod/releases/latest)
 - Unzip into game directory (should result in [Fallout2 directory]\fallout2-unlimited-party-mod-X, where X is current mod version)
 - Launch install.bat
 
